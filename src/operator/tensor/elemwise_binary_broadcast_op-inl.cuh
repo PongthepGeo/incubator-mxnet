@@ -17,6 +17,10 @@
  * under the License.
  */
 
+/*!
+ * \file elemwise_binary_broadcast_op-inl.cuh
+ * \brief CUDA specific Function definition of elementwise binary broadcast operators
+ */
 #ifndef MXNET_OPERATOR_TENSOR_ELEMWISE_BINARY_BROADCAST_OP_CUH_
 #define MXNET_OPERATOR_TENSOR_ELEMWISE_BINARY_BROADCAST_OP_CUH_
 #include <mxnet/operator_util.h>
@@ -36,7 +40,7 @@ BinaryBroadcastBackwardUseNone(const nnvm::NodeAttrs& attrs,
                                const std::vector<OpReqType>& req,
                                const std::vector<TBlob>& outputs) {
   using namespace broadcast;
-  TShape new_lshape, new_rshape, new_oshape;
+  mxnet::TShape new_lshape, new_rshape, new_oshape;
   int ndim = BinaryBroadcastShapeCompact(outputs[0].shape_, outputs[1].shape_, inputs[0].shape_,
                                          &new_lshape, &new_rshape, &new_oshape);
   if (!ndim) {
@@ -53,8 +57,22 @@ BinaryBroadcastBackwardUseNone(const nnvm::NodeAttrs& attrs,
         Tensor<gpu, 1, char> workspace =
             ctx.requested[0].get_space_typed<gpu, 1, char>(
                 Shape1(workspace_size * sizeof(index_t)), s);
-        Reduce<red::sum, NDim, DType, LOP>(s, lhs, req[0], workspace, out);
-        Reduce<red::sum, NDim, DType, ROP>(s, rhs, req[1], workspace, out);
+        if (out.shape_.Size() != 0) {
+          Reduce<red::sum, NDim, DType, LOP>(s, lhs, req[0], workspace, out);
+          Reduce<red::sum, NDim, DType, ROP>(s, rhs, req[1], workspace, out);
+        } else {
+          using namespace mxnet_op;
+          if (lhs.shape_.Size() != 0) {
+            MSHADOW_TYPE_SWITCH(lhs.type_flag_, LType, {
+              Kernel<set_zero, gpu>::Launch(s, lhs.shape_.Size(), lhs.dptr<LType>());
+            });
+          }
+          if (rhs.shape_.Size() != 0) {
+            MSHADOW_TYPE_SWITCH(rhs.type_flag_, RType, {
+              Kernel<set_zero, gpu>::Launch(s, rhs.shape_.Size(), rhs.dptr<RType>());
+            });
+          }
+        }
       });
     });
   }

@@ -18,7 +18,7 @@
  */
 
 /*!
- * \file elemwise_binary_op.h
+ * \file elemwise_binary_op-inl.h
  * \brief Function definition of elementwise binary operators
  */
 #ifndef MXNET_OPERATOR_TENSOR_ELEMWISE_BINARY_OP_INL_H_
@@ -240,7 +240,7 @@ void ElemwiseBinaryOp::RspRspOp(mshadow::Stream<cpu> *s,
           CHECK_LE(iter_out, num_rows_r);
         }
         DCHECK_LE(iter_out, num_rows_l + num_rows_r);  // Make sure that we didn't overrun
-        nnvm::TShape new_shape = output.aux_shape(rowsparse::kIdx);
+        mxnet::TShape new_shape = output.aux_shape(rowsparse::kIdx);
         CHECK_LE(iter_out, new_shape.Size());
         if (!rhs_is_dense && !lhs_is_dense && !lhs_in_place && !rhs_in_place && !scatter) {
           // Reduce the first-dimension size by the number of common rows

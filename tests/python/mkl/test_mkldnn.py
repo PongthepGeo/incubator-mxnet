@@ -24,6 +24,7 @@ import numpy as np
 import mxnet as mx
 import unittest
 from mxnet.test_utils import rand_ndarray, assert_almost_equal
+from mxnet.module import Module
 from mxnet import gluon
 from mxnet.gluon import nn
 from mxnet.test_utils import *
@@ -98,6 +99,37 @@ def test_mkldnn_engine_threading():
         assert_almost_equal(y[0, 0, 0, 0], 0.016711406)
         break
 
+@with_seed()
+def test_mkldnn_reshape():
+    def test_reshape_after_conv(dst_shape):
+        shape = (1,1,4,4)
+        data = mx.symbol.Variable('data')
+        conv = mx.symbol.Convolution(data=data, num_filter=16, kernel=(1, 1), pad=(0, 0), stride=(1, 1))
+        res = mx.symbol.reshape(data=conv, shape=dst_shape)
+        exe = res.simple_bind(mx.cpu(), data=shape, grad_req='null')
+
+        val1 = np.random.uniform(-1, 1, shape)
+        val2 = np.random.uniform(-1, 1, (16, 1, 1, 1))
+        val3 = np.random.uniform(-1 ,1, (1))
+
+        exe.arg_arrays[0][:] = val1
+        exe.arg_arrays[1][:] = val2
+        exe.arg_arrays[2][:] = val3
+        outputs = exe.forward(is_train=False)[0].asnumpy()
+
+        conv_exe = conv.simple_bind(mx.cpu(), data=shape, grad_req='null')
+        conv_exe.arg_arrays[0][:] = val1
+        conv_exe.arg_arrays[1][:] = val2
+        conv_exe.arg_arrays[2][:] = val3
+        data_npy = conv_exe.forward(is_train=False)[0].asnumpy()
+        assert_almost_equal(outputs, data_npy.reshape(dst_shape))
+
+
+    # Test mkldnn reshape (Using shape)
+    test_cases = [(256), (16, 16), (4, 4, 16), (4, 4, 4, 4)]
+    for test_case in test_cases:
+        test_reshape_after_conv(test_case)
+
 
 @with_seed()
 def test_reshape_before_conv():
@@ -129,8 +161,8 @@ def test_reshape_before_conv():
     with mx.autograd.record():
         out2 = net(x)
     out2.backward()
-    mx.test_utils.assert_almost_equal(dx1.asnumpy(), x.grad.asnumpy(), rtol=1e-5, atol=1e-6)
-    mx.test_utils.assert_almost_equal(out1.asnumpy(), out2.asnumpy(), rtol=1e-5, atol=1e-6)
+    assert_almost_equal(dx1, x.grad, rtol=1e-5, atol=1e-6)
+    assert_almost_equal(out1, out2, rtol=1e-5, atol=1e-6)
 
 
 @with_seed()
@@ -163,8 +195,8 @@ def test_slice_before_conv():
     with mx.autograd.record():
         out2 = net(x)
     out2.backward()
-    mx.test_utils.assert_almost_equal(dx1.asnumpy(), x.grad.asnumpy(), rtol=1e-5, atol=1e-6)
-    mx.test_utils.assert_almost_equal(out1.asnumpy(), out2.asnumpy(), rtol=1e-5, atol=1e-6)
+    assert_almost_equal(dx1, x.grad, rtol=1e-5, atol=1e-6)
+    assert_almost_equal(out1, out2, rtol=1e-5, atol=1e-6)
 
 
 @with_seed()
@@ -197,8 +229,28 @@ def test_slice_reshape_before_conv():
     with mx.autograd.record():
         out2 = net(x)
     out2.backward()
-    mx.test_utils.assert_almost_equal(dx1.asnumpy(), x.grad.asnumpy(), rtol=1e-5, atol=1e-6)
-    mx.test_utils.assert_almost_equal(out1.asnumpy(), out2.asnumpy(), rtol=1e-5, atol=1e-6)
+    assert_almost_equal(dx1, x.grad, rtol=1e-5, atol=1e-6)
+    assert_almost_equal(out1, out2, rtol=1e-5, atol=1e-6)
+
+
+@with_seed()
+def test_flatten_slice_after_conv():
+    data = mx.symbol.Variable('data')
+    weight = mx.symbol.Variable('weight')
+    bias = mx.symbol.Variable('bias')
+    conv1= mx.symbol.Convolution(data = data, weight=weight, bias=bias, name='conv1', num_filter=64, kernel=(3,3), stride=(1,1))
+    flatten1 = mx.symbol.flatten(data = conv1)
+    slice1 = mx.symbol.slice(data = flatten1, begin=0, end=1)
+
+    shape = (2, 16, 16, 16)
+    val = np.random.rand(2, 16, 16, 16).astype(np.float32)
+    exe = slice1.simple_bind(Context.default_ctx, data=shape)
+    exe.arg_arrays[0][:] = val
+    exe.arg_arrays[1][:] = np.random.normal(size=exe.arg_arrays[1].shape)
+    exe.arg_arrays[2][:] = np.random.normal(size=exe.arg_arrays[2].shape)
+    p = exe.forward(is_train=False)
+    p[0].wait_to_read()
+    print(p[0])
 
 
 def test_mkldnn_sum_inplace_with_cpu_layout():
@@ -285,19 +337,24 @@ def test_pooling():
 def test_activation():
     def check_activation_training(stype):
         for shape in [(2, 3, 3), (2, 3, 2, 2)]:
+            eps = 1e-5
             data_tmp = np.random.normal(-0.1, 1, size=shape)
+            # Avoid finite difference method inaccuracies due to discontinuous gradient at the origin.
+            # Here we replace small problematic inputs with 1.0.  Repro issue with seed 851486559.
+            data_tmp[abs(data_tmp) < eps] = 1.0
 
             data = mx.symbol.Variable('data', stype=stype)
             in_location = [mx.nd.array(data_tmp).tostype(stype)]
 
             test = mx.symbol.Activation(data, act_type="relu")
-            check_numeric_gradient(test, in_location, numeric_eps=1e-5, rtol=0.16, atol=1e-4)
+            check_numeric_gradient(test, in_location, numeric_eps=eps, rtol=0.16, atol=1e-4)
 
     stypes = ['row_sparse', 'default']
     for stype in stypes:
         check_activation_training(stype)
 
 
+@with_seed()
 def test_convolution():
     def check_convolution_training(stype):
         for shape in [(3, 3, 10), (3, 3, 10, 10)]:
@@ -322,6 +379,8 @@ def test_convolution():
         check_convolution_training(stype)
 
 
+@with_seed()
+@unittest.skip("Flaky test https://github.com/apache/incubator-mxnet/issues/12579")
 def test_Deconvolution():
     def check_Deconvolution_training(stype):
         for shape in [(3, 3, 10), (3, 3, 10, 10)]:
@@ -380,6 +439,21 @@ def test_fullyconnected():
     for stype in stypes:
         check_fullyconnected_training(stype)
 
+def test_softmax_with_large_inputs():
+    def softmax_forward(input_data, true_output):
+        data = mx.sym.Variable('data')
+        out1 = data.softmax(axis=1)
+        exec1 = out1.bind(mx.cpu(), args={'data': input_data})
+        exec1.forward()[0].wait_to_read()
+        ndarr = exec1.outputs[0][0][0][0]
+        nparr = ndarr.asnumpy()
+        assert_almost_equal(nparr, true_output, rtol=1e-5, atol=1e-5)
+
+    softmax_forward(mx.nd.array([[[[-1e30,-1e30]]]]), np.array([1.0,1.0]))
+    softmax_forward(mx.nd.array([[[[1e30,1e30]]]]), np.array([1.0,1.0]))
+    softmax_forward(mx.nd.array([[[[-3.4e38,-3.4e38]]]]), np.array([1.0,1.0]))
+    softmax_forward(mx.nd.array([[[[3.4e38,3.4e38]]]]), np.array([1.0,1.0]))
+
 @with_seed()
 def test_non_mkldnn_fcomputeex():
     # test special case where MKLDNN formatted NDArray feeds into non-mkldnn fcomputeex operator
@@ -424,6 +498,143 @@ def test_non_mkldnn_fcomputeex():
     exec1 = custom.bind(mx.cpu(), args={'data': mx.nd.ones([10,3,96,96]), 'conv_weight': mx.nd.ones([8,3,5,5])})
     exec1.forward()[0].wait_to_read()
 
+@with_seed()
+def test_conv_transpose():
+    axes = [(0,2,1,3), (0,2,3,1), (1,2,3,0), (3,2,1,0)]
+    a = np.random.rand(10, 16, 50, 50)
+    b = np.random.rand(32, 16, 3, 3)
+    x = mx.nd.array(a)
+    w = mx.nd.array(b)
+    y = mx.nd.Convolution(data=x, weight=w, kernel=(3, 3), num_group=1, num_filter=32, no_bias=True)
+    for axis in axes:
+        t = mx.nd.transpose(y, axis)
+        t.wait_to_read()
+        s = y.asnumpy()
+        n = np.transpose(s, axis)
+        np.allclose(t.asnumpy(), n)
+
+
+# This test case is contributed by @awsbillz in https://github.com/apache/incubator-mxnet/issues/14766
+@with_seed()
+def test_reshape_transpose_6d():
+    class Reshape2D(gluon.HybridBlock):
+        def __init__(self, factor):
+            super(Reshape2D, self).__init__()
+            self._factors = (int(factor),) * 2
+
+        def hybrid_forward(self, F, x):
+            f1, f2 = self._factors
+                                                          # (N, f1*f2*C, H, W)
+            x = F.reshape(x, (0, -4, -1, f1 * f2, 0, 0))  # (N, C, f1*f2, H, W)
+            x = F.reshape(x, (0, 0, -4, f1, f2, 0, 0))    # (N, C, f1, f2, H, W)
+            x = F.transpose(x, (0, 1, 4, 2, 5, 3))        # (N, C, H, f1, W, f2)
+            x = F.reshape(x, (0, 0, -3, -3))              # (N, C, H*f1, W*f2)
+            return x
+
+
+    class Net(gluon.HybridBlock):
+        def __init__(self, **kwargs):
+            super(Net, self).__init__(**kwargs)
+            with self.name_scope():
+                self.conv1 = nn.Conv2D(8, kernel_size=5)
+                self.reshape2D = Reshape2D(2)
+
+        def hybrid_forward(self, F, x):
+            x = self.conv1(x)
+            x = self.reshape2D(x)
+            return x
+
+    net = Net()
+    net.initialize(mx.init.Xavier(), ctx=mx.cpu())
+    net.hybridize()
+    data = mx.nd.random_normal(shape=(1, 3, 600, 600))
+    output = net(data)
+    a = output.asnumpy()
+
+@with_seed()
+def test_weight_async_reorder():
+    data = mx.sym.Variable("data")
+    w1 = mx.sym.Variable("1_weight")
+    w2 = mx.sym.Variable("2_weight")
+    conv1 = mx.sym.Convolution(data=data, weight=w1 + w1, num_filter=32, no_bias=True, kernel=(3, 3))
+    conv2 = mx.sym.Convolution(data=conv1, weight=w2 + w2, num_filter=32, no_bias=True, kernel=(1, 1))
+    mod = Module(symbol=conv2, label_names=None, context=mx.current_context())
+    mod.bind(for_training=False, data_shapes=[('data', (10, 16, 50, 50))])
+    mod.init_params(initializer=mx.init.Xavier(magnitude=2.))
+    data = [mx.random.uniform(-1.0, 1.0, shape=(10, 16, 50, 50), ctx=mx.current_context())]
+    batch=mx.io.DataBatch(data, [])
+    for i in range(2):
+        mod.forward(batch, is_train=False)
+        for output in mod.get_outputs():
+            output.wait_to_read()
+
+@with_seed()
+def test_concat():
+    def ref_concat(a, b, axis):
+      return np.concatenate((a, b), axis=axis)
+
+    a_sym = mx.sym.Variable("a")
+    b_sym = mx.sym.Variable("b")
+    dshape = rand_shape_nd(4)
+    a_shape = tuple(dshape)
+    b_shape = tuple(dshape)
+
+    for axis in range(0, 4):
+      z = mx.sym.concat(a_sym, b_sym, dim=axis)
+      a = np.random.uniform(-1, 1, a_shape)
+      b = np.random.uniform(-1, 1, b_shape)
+      exe = z.simple_bind(ctx=mx.cpu(), a=a_shape, b=b_shape)
+      out = exe.forward(is_train=False, a=a, b=b)
+      ref_out = ref_concat(a, b, axis=axis)
+      out = out[0].asnumpy()
+      assert_almost_equal(out, ref_out)
+
+    def check_concat_training(stype):
+        data_shape = rand_shape_nd(4)
+        for density in [1.0, 0.5, 0.0]:
+            a_sym = mx.sym.Variable('a')
+            b_sym = mx.sym.Variable('b')
+            sym = mx.sym.concat(a_sym, b_sym, dim=1)
+            a = rand_ndarray(shape=data_shape, stype=stype, density=density)
+            b = rand_ndarray(shape=data_shape, stype=stype, density=density)
+            in_location = [a, b]
+            check_numeric_gradient(sym, in_location, numeric_eps=1e-3, rtol=1e-3, atol=5e-3)
+    stypes = ['row_sparse', 'default']
+    for stype in stypes:
+        check_concat_training(stype)
+
+@with_seed()
+def test_elemwise_add():
+    def ref_add(a, b):
+      return np.add(a, b)
+
+    a_sym = mx.sym.Variable("a")
+    b_sym = mx.sym.Variable("b")
+    dshape = rand_shape_nd(4)
+    a_shape = tuple(dshape)
+    b_shape = tuple(dshape)
+    z = mx.sym.elemwise_add(a_sym, b_sym)
+    a = np.random.uniform(-1, 1, a_shape)
+    b = np.random.uniform(-1, 1, b_shape)
+    exe = z.simple_bind(ctx=mx.cpu(), a=a_shape, b=b_shape)
+    out = exe.forward(is_train=False, a=a, b=b)
+    ref_out = ref_add(a, b)
+    out = out[0].asnumpy()
+    assert_almost_equal(out, ref_out, rtol=1e-6, atol=1e-6)
+
+    def check_elemwise_add_training(stype):
+        data_shape = rand_shape_nd(4)
+        for density in [1.0, 0.5, 0.0]:
+            a_sym = mx.sym.Variable('a')
+            b_sym = mx.sym.Variable('b')
+            sym = mx.sym.elemwise_add(a_sym, b_sym)
+            a = rand_ndarray(shape=data_shape, stype=stype, density=density)
+            b = rand_ndarray(shape=data_shape, stype=stype, density=density)
+            in_location = [a, b]
+            check_numeric_gradient(sym, in_location, numeric_eps=1e-3, rtol=1e-3, atol=5e-3)
+    stypes = ['row_sparse', 'default']
+    for stype in stypes:
+        check_elemwise_add_training(stype)
 
 if __name__ == '__main__':
     install.test_mkldnn_install()

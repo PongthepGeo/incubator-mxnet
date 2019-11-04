@@ -21,9 +21,11 @@ import tempfile
 import mxnet as mx
 from mxnet import gluon
 from mxnet.gluon import nn
+from mxnet.base import py_str
 from mxnet.test_utils import assert_almost_equal
 from mxnet.ndarray.ndarray import _STORAGE_TYPE_STR_TO_ID
-from common import setup_module, with_seed, assertRaises, teardown, assert_raises_cudnn_disabled
+from common import (setup_module, with_seed, assertRaises, teardown,
+                    assert_raises_cudnn_not_satisfied)
 import numpy as np
 from numpy.testing import assert_array_equal
 from nose.tools import raises, assert_raises
@@ -31,6 +33,7 @@ from copy import deepcopy
 import warnings
 import json
 import unittest
+import random
 
 @with_seed()
 def test_parameter():
@@ -93,7 +96,7 @@ def test_parameter_invalid_access():
     assertRaises(RuntimeError, p1.list_row_sparse_data, row_id)
 
 @with_seed()
-def test_paramdict():
+def test_parameter_dict():
     ctx = mx.cpu(1)
     params0 = gluon.ParameterDict('net_')
     params0.get('w0', shape=(10, 10))
@@ -106,13 +109,13 @@ def test_paramdict():
     prev_w0 = params0.get('w0').data(ctx)
     prev_w1 = params0.get('w1').row_sparse_data(all_row_ids)
     # save params
-    params0.save('test_paramdict.params')
+    params0.save('test_parameter_dict.params')
 
     # load params
     params1 = gluon.ParameterDict('net_')
     params1.get('w0', shape=(10, 10))
     params1.get('w1', shape=(10, 10), stype='row_sparse')
-    params1.load('test_paramdict.params', ctx)
+    params1.load('test_parameter_dict.params', ctx)
     trainer1 = mx.gluon.Trainer(params1, 'sgd')
 
     # compare the values before and after save/load
@@ -126,13 +129,44 @@ def test_paramdict():
     params2 = gluon.ParameterDict('net_')
     params2.get('w0', shape=(10, 10))
     params2.get('w1', shape=(10, 10))
-    params2.load('test_paramdict.params', ctx)
+    params2.load('test_parameter_dict.params', ctx)
 
     # compare the values before and after save/load
     cur_w0 = params2.get('w0').data(ctx)
     cur_w1 = params2.get('w1').data(ctx)
     mx.test_utils.assert_almost_equal(prev_w0.asnumpy(), cur_w0.asnumpy())
     mx.test_utils.assert_almost_equal(prev_w1.asnumpy(), cur_w1.asnumpy())
+
+    # test reset_ctx
+    params3 = gluon.ParameterDict('net_')
+    params3.get('w0', shape=(10, 10))
+    params3.get('w1', shape=(10, 10))
+    params3.initialize(ctx=ctx)
+    list_contexts = [mx.cpu(42), mx.cpu(24)]
+    params3.reset_ctx(list_contexts)
+    for p in params3.values():
+        assert set(p.list_ctx()) == set(list_contexts)
+
+    # and test list_ctx
+    assert set(params3.list_ctx()) == set(list_contexts)
+
+
+    # test the dtype casting functionality
+    params0 = gluon.ParameterDict('')
+    params0.get('w0', shape=(10, 10), dtype='float32')
+    params0.get('w1', shape=(10, 10), dtype='int8')
+    params0.initialize(mx.init.One(), ctx=ctx)
+    params0.save('test_parameter_dict.params')
+
+    params1 = gluon.ParameterDict('')
+    params1.get('w0', shape=(10, 10), dtype='float16')
+    params1.get('w1', shape=(10, 10), dtype='float64')
+    params1.load('test_parameter_dict.params', cast_dtype=True, dtype_source='current')
+    assert params1['w0'].data().dtype == np.float16
+    assert params1['w1'].data().dtype == np.float64
+    params1.load('test_parameter_dict.params', cast_dtype=True, dtype_source='saved')
+    assert params1['w0'].data().dtype == np.float32
+    assert params1['w1'].data().dtype == np.int8
 
 
 @with_seed()
@@ -241,7 +275,7 @@ def test_parameter_str():
 
 
 @with_seed()
-def test_collect_paramters():
+def test_collect_parameters():
     net = nn.HybridSequential(prefix="test_")
     with net.name_scope():
         net.add(nn.Conv2D(10, 3))
@@ -339,7 +373,7 @@ def test_symbol_block():
     net.hybridize()
     assert isinstance(net(mx.nd.zeros((16, 10))), mx.nd.NDArray)
 
-    # Test case to verify if initializing the SymbolBlock from a model with params 
+    # Test case to verify if initializing the SymbolBlock from a model with params
     # other than fp32 param dtype.
 
     # 1. Load a resnet model, cast it to fp64 and export
@@ -354,18 +388,30 @@ def test_symbol_block():
     net_fp32.forward(data)
     net_fp32.export(tmpfile, 0)
 
-    # 2. Load the saved model and verify if all the params are loaded correctly.
-    # and choose one of the param to verify the type if fp64.
-    sm = mx.sym.load(tmpfile + '-symbol.json')
+    # 2.a Load the saved model and verify if all the params are loaded correctly.
+    # and choose one of the param to verify the type if fp64.\
+    sym_file = tmpfile + '-symbol.json'
+    params_file = tmpfile + '-0000.params'
+    sm = mx.sym.load(sym_file)
     inputs = mx.sym.var('data', dtype='float64')
     net_fp64 = mx.gluon.SymbolBlock(sm, inputs)
-    net_fp64.collect_params().load(tmpfile + '-0000.params', ctx=ctx)
-    # 3. Get a conv layer's weight parameter name. Conv layer's weight param is
+    net_fp64.collect_params().load(params_file, ctx=ctx)
+    # Get a conv layer's weight parameter name. Conv layer's weight param is
     # expected to be of dtype casted, fp64.
     for param_name in net_fp64.params.keys():
         if 'conv' in param_name and 'weight' in param_name:
             break
     assert np.dtype(net_fp64.params[param_name].dtype) == np.dtype(np.float64)
+
+    # 3.b Verify same functionnality with the imports API
+    net_fp_64 = mx.gluon.SymbolBlock.imports(sym_file, 'data', params_file, ctx=ctx)
+
+    # Get a conv layer's weight parameter name. Conv layer's weight param is
+    # expected to be of dtype casted, fp64.
+    for param_name in net_fp_64.params.keys():
+        if 'conv' in param_name and 'weight' in param_name:
+            break
+    assert np.dtype(net_fp_64.params[param_name].dtype) == np.dtype(np.float64)
 
     # Cast the symbol block to FP32 and try to forward a FP32 data.
     # This will verify SymbolBlock.cast() functionality.
@@ -397,6 +443,138 @@ def test_sparse_hybrid_block():
     y = net(x)
 
 @with_seed()
+def test_hybrid_block_none_args():
+    class Foo(gluon.HybridBlock):
+        def hybrid_forward(self, F, a, b):
+            if a is None and b is not None:
+                return b
+            elif b is None and a is not None:
+                return a
+            elif a is not None and b is not None:
+                return a + b
+            else:
+                raise NotImplementedError
+
+    class FooDefault(gluon.HybridBlock):
+        def hybrid_forward(self, F, a, b=None):
+            if a is None and b is not None:
+                return b
+            elif b is None and a is not None:
+                return a
+            elif a is not None and b is not None:
+                return a + b
+            else:
+                raise NotImplementedError
+
+
+    class FooNested(gluon.HybridBlock):
+        def __init__(self, prefix=None, params=None):
+            super(FooNested, self).__init__(prefix=prefix, params=params)
+            self.f1 = Foo(prefix='foo1')
+            self.f2 = Foo(prefix='foo2')
+            self.f3 = Foo(prefix='foo3')
+
+        def hybrid_forward(self, F, a, b):
+            data = self.f1(a, b)
+            data = self.f2(a, data)
+            data = self.f3(data, b)
+            return data
+
+    for arg_inputs in [(None, mx.nd.ones((10,))),
+                       (mx.nd.ones((10,)), mx.nd.ones((10,))),
+                       (mx.nd.ones((10,)), None)]:
+        foo1 = FooNested(prefix='foo_nested_hybridized')
+        foo1.hybridize()
+        foo2 = FooNested(prefix='foo_nested_nohybrid')
+        for _ in range(2): # Loop for 2 times to trigger forwarding of the cached version
+            out1 = foo1(*arg_inputs)
+            out2 = foo2(*arg_inputs)
+            if isinstance(out1, tuple):
+                for lhs, rhs in zip(out1, out2):
+                    assert_almost_equal(lhs.asnumpy(), rhs.asnumpy())
+            else:
+                assert_almost_equal(out1.asnumpy(), out2.asnumpy())
+    for do_hybridize in [True, False]:
+        foo = FooNested()
+        if do_hybridize:
+            foo.hybridize()
+        assert_raises(ValueError, foo, None, None)
+
+    # Make sure the ValueError is correctly raised
+    foo = FooNested()
+    foo.hybridize()
+    foo(None, mx.nd.ones((10,)))  # Pass for the first time to initialize the cached op
+    assert_raises(ValueError, lambda: foo(mx.nd.ones((10,)), mx.nd.ones((10,))))
+    foo = FooNested()
+    assert_raises(ValueError, lambda: foo(mx.nd.ones((10,)), mx.sym.var('a')))
+    foo = FooNested()
+    assert_raises(ValueError, lambda: foo(mx.sym.var('a'), mx.nd.ones((10,))))
+
+    # Test the case of the default values
+    foo1 = FooDefault()
+    foo1.hybridize()
+    foo2 = FooDefault()
+    out1 = foo1(mx.nd.ones((10,)))
+    out2 = foo2(mx.nd.ones((10,)))
+    out3 = foo1(mx.nd.ones((10,)), None)
+    out4 = foo2(mx.nd.ones((10,)), None)
+    assert_almost_equal(out1.asnumpy(), out2.asnumpy())
+    assert_almost_equal(out1.asnumpy(), out3.asnumpy())
+    assert_almost_equal(out1.asnumpy(), out4.asnumpy())
+    foo1 = FooDefault()
+    foo1.hybridize()
+    out1 = foo1(mx.nd.ones((10,)), None)
+    out2 = foo1(mx.nd.ones((10,)))
+    assert_almost_equal(out1.asnumpy(), out2.asnumpy())
+    assert_raises(ValueError, lambda: foo1(mx.nd.ones((10,)), mx.nd.ones((10,))))
+
+
+@with_seed()
+def test_hybrid_block_hybrid_no_hybrid():
+    class FooHybrid(gluon.HybridBlock):
+        def hybrid_forward(self, F, a, b):
+            if isinstance(a, (list, tuple)):
+                a = sum(a)
+            if isinstance(b, (list, tuple)):
+                b = sum(b)
+            return a + b
+
+    class Foo(gluon.Block):
+        def forward(self, a, b):
+            if isinstance(a, (list, tuple)):
+                a = sum(a)
+            if isinstance(b, (list, tuple)):
+                b = sum(b)
+            return a + b
+    # When hybridize is not called, HybridBlock acts the same as Block
+    foo_hybrid = FooHybrid()
+    foo = Foo()
+    for a, b in [(mx.nd.ones((10,)), 1),
+                 (mx.nd.ones((20,)), 2),
+                 ([mx.nd.ones((10,)), mx.nd.ones((10,))],
+                  [mx.nd.ones((10)), mx.nd.ones((10,)), mx.nd.ones((10,))]),
+                 ([mx.nd.ones((10,)), mx.nd.ones((10,))], 3)]:
+        hybrid_block_out = foo_hybrid(a, b)
+        block_out = foo(a, b)
+        assert_almost_equal(hybrid_block_out.asnumpy(), block_out.asnumpy())
+    # When hybridize is called, we need to make sure that the model raises for the unsupported cases
+    # 1. Scalar values in the input
+    # 2. No mixing of sym/ndarray
+    # 3. No mixing of cpu ndarray and gpu ndarray  (Tested in gpu/test_gluon_gpu.py)
+    # 4. Allow mixing of cpu_pinned and cpu
+    foo_hybrid = FooHybrid()
+    foo_hybrid.hybridize()
+    assert_raises(ValueError, lambda: foo_hybrid(mx.nd.ones((10,)), 1))
+    foo_hybrid = FooHybrid()
+    foo_hybrid.hybridize()
+    assert_raises(ValueError, lambda: foo_hybrid(mx.nd.ones((10,)), mx.sym.var('a')))
+    foo_hybrid = FooHybrid()
+    foo_hybrid.hybridize()
+    assert_raises(ValueError, lambda: foo_hybrid(mx.nd.ones((10,), ctx=mx.cpu(1)),
+                                                 mx.nd.ones((10,), ctx=mx.cpu(2))))
+
+
+@with_seed()
 def check_layer_forward(layer, dshape):
     print("checking layer {}\nshape: {}.".format(layer, dshape))
     layer.collect_params().initialize()
@@ -420,7 +598,6 @@ def check_layer_forward(layer, dshape):
     mx.test_utils.assert_almost_equal(np_out, out.asnumpy(), rtol=1e-5, atol=1e-6)
     mx.test_utils.assert_almost_equal(np_dx, x.grad.asnumpy(), rtol=1e-5, atol=1e-6)
 
-@unittest.skip("Flaky test: https://github.com/apache/incubator-mxnet/issues/11506")
 @with_seed()
 def test_conv():
     layers1d = [
@@ -506,56 +683,201 @@ def test_deconv():
 
 @with_seed()
 def test_pool():
-    layers1d = [
-        nn.MaxPool1D(),
-        nn.MaxPool1D(3),
-        nn.MaxPool1D(3, 2),
-        nn.AvgPool1D(),
-        nn.AvgPool1D(count_include_pad=False),
-        nn.GlobalAvgPool1D(),
-        ]
-    for layer in layers1d:
-        check_layer_forward(layer, (1, 2, 10))
+    # transpose shape to bring feature dimension 'c' from 2nd position to last
+    def transpose(shape):
+        return (shape[0],) + shape[2:] + (shape[1],)
+
+    for layout in ['NCW', 'NWC']:
+        shape1d = (1, 2, 10)
+        if layout == 'NWC':
+            shape1d = transpose(shape1d)
+        layers1d = [
+            nn.MaxPool1D(layout=layout),
+            nn.MaxPool1D(3, layout=layout),
+            nn.MaxPool1D(3, 2, layout=layout),
+            nn.AvgPool1D(layout=layout),
+            nn.AvgPool1D(count_include_pad=False, layout=layout),
+            nn.GlobalAvgPool1D(layout=layout),
+            ]
+        for layer in layers1d:
+            check_layer_forward(layer, shape1d)
 
 
-    layers2d = [
-        nn.MaxPool2D(),
-        nn.MaxPool2D((3, 3)),
-        nn.MaxPool2D(3, 2),
-        nn.AvgPool2D(),
-        nn.AvgPool2D(count_include_pad=False),
-        nn.GlobalAvgPool2D(),
-        ]
-    for layer in layers2d:
-        check_layer_forward(layer, (1, 2, 10, 10))
+    for layout in ['NCHW', 'NHWC']:
+        shape2d = (1, 2, 10, 10)
+        if layout == 'NHWC':
+            shape2d = transpose(shape2d)
+        layers2d = [
+            nn.MaxPool2D(layout=layout),
+            nn.MaxPool2D((3, 3), layout=layout),
+            nn.MaxPool2D(3, 2, layout=layout),
+            nn.AvgPool2D(layout=layout),
+            nn.AvgPool2D(count_include_pad=False, layout=layout),
+            nn.GlobalAvgPool2D(layout=layout),
+            ]
+        for layer in layers2d:
+            check_layer_forward(layer, shape2d)
 
-    layers3d = [
-        nn.MaxPool3D(),
-        nn.MaxPool3D((3, 3, 3)),
-        nn.MaxPool3D(3, 2),
-        nn.AvgPool3D(),
-        nn.AvgPool3D(count_include_pad=False),
-        nn.GlobalAvgPool3D(),
-        ]
-    for layer in layers3d:
-        check_layer_forward(layer, (1, 2, 10, 10, 10))
+    for layout in ['NCDHW', 'NDHWC']:
+        shape3d = (1, 2, 10, 10, 10)
+        if layout == 'NDHWC':
+            shape3d = transpose(shape3d)
+        layers3d = [
+            nn.MaxPool3D(layout=layout),
+            nn.MaxPool3D((3, 3, 3), layout=layout),
+            nn.MaxPool3D(3, 2, layout=layout),
+            nn.AvgPool3D(layout=layout),
+            nn.AvgPool3D(count_include_pad=False, layout=layout),
+            nn.GlobalAvgPool3D(layout=layout),
+            ]
+        for layer in layers3d:
+            check_layer_forward(layer, shape3d)
 
     # test ceil_mode
-    x = mx.nd.zeros((2, 2, 10, 10))
+    for layout in ['NCHW', 'NHWC']:
+        xshape = (2, 2, 10, 10)
+        noceil_out_shape = (2, 2, 3, 3)
+        ceil_out_shape = (2, 2, 4, 4)
+        if layout == 'NHWC':
+            xshape = transpose(xshape)
+            noceil_out_shape = transpose(noceil_out_shape)
+            ceil_out_shape = transpose(ceil_out_shape)
 
-    layer = nn.MaxPool2D(3, ceil_mode=False)
-    layer.collect_params().initialize()
-    assert (layer(x).shape==(2, 2, 3, 3))
+        x = mx.nd.zeros(xshape)
 
-    layer = nn.MaxPool2D(3, ceil_mode=True)
-    layer.collect_params().initialize()
-    assert (layer(x).shape==(2, 2, 4, 4))
+        layer = nn.MaxPool2D(3, ceil_mode=False, layout=layout)
+        layer.collect_params().initialize()
+        assert (layer(x).shape==noceil_out_shape)
+
+        layer = nn.MaxPool2D(3, ceil_mode=True, layout=layout)
+        layer.collect_params().initialize()
+        assert (layer(x).shape==ceil_out_shape)
 
 
 @with_seed()
 def test_batchnorm():
     layer = nn.BatchNorm(in_channels=10)
     check_layer_forward(layer, (2, 10, 10, 10))
+
+
+@with_seed()
+def test_sync_batchnorm():
+    def _check_batchnorm_result(input, num_devices=1, cuda=False):
+        from mxnet.gluon.utils import split_and_load
+
+        def _find_bn(module):
+            if isinstance(module, (mx.gluon.nn.BatchNorm, mx.gluon.contrib.nn.SyncBatchNorm)):
+                return module
+            elif isinstance(module.module, (mx.gluon.nn.BatchNorm, mx.gluon.contrib.nn.SyncBatchNorm)):
+                return module.module
+
+            raise RuntimeError('BN not found')
+
+        def _syncParameters(bn1, bn2, ctx):
+            ctx = input.context
+            bn2.gamma.set_data(bn1.gamma.data(ctx))
+            bn2.beta.set_data(bn1.beta.data(ctx))
+            bn2.running_mean.set_data(bn1.running_mean.data(ctx))
+            bn2.running_var.set_data(bn1.running_var.data(ctx))
+
+        input1 = input.copy()
+        input2 = input.copy()
+
+        if cuda:
+            input1 = input.as_in_context(mx.gpu(0))
+            ctx_list = [mx.gpu(i) for i in range(num_devices)]
+        else:
+            ctx_list = [mx.cpu(0) for _ in range(num_devices)]
+
+        nch = input.shape[1] if input.ndim > 1 else 1
+        bn1 = mx.gluon.nn.BatchNorm(in_channels=nch)
+        bn2 = mx.gluon.contrib.nn.SyncBatchNorm(
+            in_channels=nch, num_devices=num_devices)
+
+        bn1.initialize(ctx=ctx_list[0])
+        bn2.initialize(ctx=ctx_list)
+
+        # using the same values for gamma and beta
+        #_syncParameters(_find_bn(bn1), _find_bn(bn2), ctx_list[0])
+
+        input1.attach_grad()
+        inputs2 = split_and_load(input2, ctx_list, batch_axis=0)
+        for xi in inputs2:
+            xi.attach_grad()
+
+        with mx.autograd.record():
+            output1 = bn1(input1)
+            output2 = [bn2(xi) for xi in inputs2]
+            loss1 = (output1 ** 2).sum()
+            loss2 = [(output ** 2).sum() for output in output2]
+            mx.autograd.backward(loss1)
+            mx.autograd.backward(loss2)
+
+        output2 = mx.nd.concat(*[output.as_in_context(input.context)
+                                 for output in output2], dim=0)
+        # check bn1
+
+        momentum = 0.9
+        epsilon = 1e-5
+        axis = 1
+        data = input1
+        running_mean = mx.nd.zeros(nch, ctx=data.context)
+        running_var = mx.nd.ones(nch, ctx=data.context)
+
+        data_mean = data.mean(
+            axis=axis, exclude=True, keepdims=True)
+        data_var = (data - data_mean).square().mean(axis=axis,
+                                                    exclude=True, keepdims=True)
+
+        target_output = (data - data_mean) / (data_var + epsilon).sqrt()
+
+        # squeeze data_mean and data_var
+        data_mean_flat = data_mean.squeeze()
+        data_var_flat = data_var.squeeze()
+
+        running_mean = running_mean * momentum + \
+            data_mean_flat * (1 - momentum)
+        running_var = running_var * momentum + \
+            data_var_flat * (1 - momentum)
+
+        atol = 1e-2
+        rtol = 1e-2
+        assert_almost_equal(output1.asnumpy(), target_output.asnumpy(),
+                            atol=atol, rtol=rtol)
+        assert_almost_equal(_find_bn(bn1).running_mean.data(ctx_list[0]).asnumpy(),
+                            running_mean.asnumpy(),
+                            atol=atol, rtol=rtol)
+        assert_almost_equal(_find_bn(bn1).running_var.data(ctx_list[0]).asnumpy(),
+                            running_var.asnumpy(),
+                            atol=atol, rtol=rtol)
+        # assert forwarding
+        assert_almost_equal(input1.asnumpy(), input2.asnumpy(),
+                            atol=atol, rtol=rtol)
+        assert_almost_equal(output1.asnumpy(),
+                            output2.asnumpy(), atol=atol, rtol=rtol)
+        assert_almost_equal(_find_bn(bn1).running_mean.data(ctx_list[0]).asnumpy(),
+                            _find_bn(bn2).running_mean.data(ctx_list[0]).asnumpy(),
+                            atol=atol, rtol=rtol)
+        assert_almost_equal(_find_bn(bn1).running_var.data(ctx_list[0]).asnumpy(),
+                            _find_bn(bn2).running_var.data(ctx_list[0]).asnumpy(),
+                            atol=atol, rtol=rtol)
+        input2grad = mx.nd.concat(
+            *[output.grad.as_in_context(input.context) for output in inputs2], dim=0)
+        assert_almost_equal(input1.grad.asnumpy(),
+                            input2grad.asnumpy(), atol=atol, rtol=rtol)
+
+    cfgs = [(1, False)]
+    num_gpus = mx.context.num_gpus()
+    for i in range(1, num_gpus + 1):
+        cfgs.append((i, True))
+    for ndev, cuda in cfgs:
+        # check with unsync version
+        for shape in [(24, 2), (24, 3, 4), (24, 4, 4, 4), (24, 5, 6, 4, 4)]:
+            print(str((ndev, cuda, shape)))
+            for i in range(10):
+                _check_batchnorm_result(mx.nd.random.uniform(shape=shape,
+                                                             ctx=mx.cpu(0)),
+                                        num_devices=ndev, cuda=cuda)
 
 
 @with_seed()
@@ -568,6 +890,15 @@ def test_layernorm():
     layer = nn.LayerNorm(in_channels=10)
     check_layer_forward(layer, (2, 10, 10, 10))
 
+
+@with_seed()
+def test_groupnorm():
+    layer = nn.GroupNorm()
+    check_layer_forward(layer, (2, 10, 10, 10))
+    layer = nn.GroupNorm(num_groups=2)
+    check_layer_forward(layer, (2, 10, 10, 10))
+    layer = nn.GroupNorm(num_groups=5)
+    check_layer_forward(layer, (2, 10, 10, 10))
 
 @with_seed()
 def test_reflectionpad():
@@ -857,8 +1188,13 @@ def test_import():
     net2 = gluon.SymbolBlock.imports(
         'net1-symbol.json', ['data'], 'net1-0001.params', ctx)
     out2 = net2(data)
+    lines = str(net2).splitlines()
 
     assert_almost_equal(out1.asnumpy(), out2.asnumpy())
+    assert lines[0] == 'SymbolBlock('
+    assert lines[1]
+    assert lines[2] == ')'
+
 
 @with_seed()
 def test_hybrid_stale_cache():
@@ -1030,26 +1366,40 @@ def test_activations():
     elu = mx.gluon.nn.ELU()
     def elu_test(x):
         def elu(x):
-            return 1.0 * (mx.nd.exp(x) - 1) if x < 0 else x
+            return mx.nd.expm1(x) if x <= 0.0 else x
         return [elu(x_i) for x_i in x]
 
     for test_point, ref_point in zip(elu_test(point_to_validate), elu(point_to_validate)):
-        assert test_point == ref_point
+        assert_almost_equal(test_point.asnumpy(), ref_point.asnumpy())
 
     selu = mx.gluon.nn.SELU()
     def selu_test(x):
         def selu(x):
             scale, alpha = 1.0507009873554804934193349852946, 1.6732632423543772848170429916717
-            return scale * x if x >= 0 else alpha * mx.nd.exp(x) - alpha
+            return scale * x if x >= 0 else scale * alpha * mx.nd.expm1(x)
         return [selu(x_i) for x_i in x]
 
-    for test_point, ref_point in zip(selu(point_to_validate), selu(point_to_validate)):
+    for test_point, ref_point in zip(selu_test(point_to_validate), selu(point_to_validate)):
         assert test_point == ref_point
 
     prelu = mx.gluon.nn.PReLU()
     prelu.initialize()
     x = point_to_validate.reshape((1, 3, 2))
     assert_almost_equal(prelu(x).asnumpy(), mx.nd.where(x >= 0, x, 0.25 * x).asnumpy())
+
+    gelu = mx.gluon.nn.GELU()
+    def gelu_test(x):
+        CUBE_CONSTANT = 0.044715
+        ROOT_TWO_OVER_PI = 0.7978845608028654
+        def g(x):
+            return ROOT_TWO_OVER_PI * (x + CUBE_CONSTANT * x * x * x)
+        def f(x):
+            return 1.0 + mx.nd.tanh(g(x))
+        def gelu(x):
+            return 0.5 * x * f(x)
+        for test_point, ref_point in zip(gelu_test(point_to_validate), gelu(point_to_validate)):
+            assert test_point == ref_point
+
 
 @with_seed()
 def test_dropout():
@@ -1162,6 +1512,46 @@ def test_save_load():
     net2.load_parameters('tmp.params')
 
 @with_seed()
+def test_save_load_deduplicate_with_shared_params():
+    class B(mx.gluon.Block):
+        def __init__(self, params=None):
+            super(B, self).__init__(params=params)
+
+            with self.name_scope():
+                self.weight = self.params.get('weight', shape=(10, 10))
+
+    class C(mx.gluon.Block):
+        def __init__(self, b1, b2):
+            super(C, self).__init__()
+            self.b1 = b1
+            self.b2 = b2
+
+    b1 = B()
+    b2 = B(b1.collect_params())
+    c = C(b1, b2)
+    c.initialize()
+    c.save_parameters('tmp.params', deduplicate=True)
+
+    params = mx.nd.load('tmp.params')
+    assert len(params) == 1  # Only a single copy of the shared parameter is saved
+
+    b1 = B()
+    b2 = B(b1.collect_params())
+    c = C(b1, b2)
+    c.load_parameters('tmp.params')
+
+    # Test default behavior
+    c.save_parameters('tmp2.params', deduplicate=False)
+
+    params = mx.nd.load('tmp2.params')
+    assert len(params) == 2  # Only a single copy of the shared parameter is saved
+
+    b1 = B()
+    b2 = B(b1.collect_params())
+    c = C(b1, b2)
+    c.load_parameters('tmp2.params')
+
+@with_seed()
 def test_symbol_block_save_load():
     class Net(gluon.HybridBlock):
         def __init__(self):
@@ -1199,15 +1589,62 @@ def test_hybrid_multi_context():
 
 @with_seed()
 def test_zero_grad():
-    data = mx.nd.random.uniform(shape=(3,3))
-    net = nn.Embedding(3, 4, sparse_grad=True, prefix='test_zero_grad_')
-    net.initialize()
-    with mx.autograd.record():
-        l = net(data)
-        l.backward()
-    net.collect_params().zero_grad()
-    grad = net.collect_params()['test_zero_grad_weight'].grad()
-    assert_almost_equal(grad.asnumpy(), grad.asnumpy() * 0)
+    def _test_grad_reset(ctx, dtype='float32', sparse=False, embeddingType=None):
+        data = mx.nd.random.uniform(shape=(3,3), dtype=dtype, ctx=ctx)
+        if embeddingType is None:
+            embeddingType = dtype
+        net = nn.Embedding(3, 4, sparse_grad=sparse, prefix='test_zero_grad_', dtype=embeddingType)
+        net.initialize(ctx=ctx)
+        with mx.autograd.record():
+            l = net(data)
+            l.backward()
+        net.collect_params().zero_grad()
+        grad = net.collect_params()['test_zero_grad_weight'].grad()
+        assert_almost_equal(grad.asnumpy(), grad.asnumpy() * 0)
+
+    def _test_multi_reset(nArrays, dtype, ctx):
+        # Construct the list of non-zeros arrays with random shapes
+        arr = []
+        for _ in range(nArrays):
+            arrType = random.choice(dtype) if isinstance(dtype, list) else dtype
+            shape = ()
+            for _ in range(np.random.randint(1, 5)):
+                shape = shape + (np.random.randint(1, 10),)
+            arr.append(mx.nd.random.uniform(shape=shape, dtype=arrType, ctx=ctx))
+
+        # Reset all arrays
+        mx.nd.reset_arrays(*arr, num_arrays=len(arr))
+
+        # Check results
+        for i in range(nArrays):
+            grad = arr[i].asnumpy()
+            assert_almost_equal(grad, grad * 0)
+
+
+    # Setting context for current test
+    ctx = mx.context.current_context()
+
+    # Launching _test_multi_reset 10 times with different types & randomly chosen nArrays
+    testedTypes = ['float16', 'float32', 'float64']
+    for _ in range(10):
+        for type in [testedTypes] + testedTypes:
+            _test_multi_reset(np.random.randint(1, 50), type, ctx)
+
+    # Saving value of environment variable, if it was defined
+    envVarKey = 'MXNET_STORAGE_FALLBACK_LOG_VERBOSE'
+    envVarValue = os.environ[envVarKey] if envVarKey in os.environ else None
+    # Changing value of environment variable
+    os.environ[envVarKey] = '0'
+    for type in ['float16', 'float32', 'float64']:
+        for embType in ['float32', 'float64']:
+            for sparse in [True, False]:
+                _test_grad_reset(ctx, dtype=type, sparse=sparse, embeddingType=embType)
+
+    # Remove or restore the value of environment variable
+    if envVarValue is None:
+        del os.environ[envVarKey]
+    else:
+        os.environ[envVarKey] = envVarValue
 
 def check_hybrid_static_memory(**kwargs):
     x = mx.nd.random.uniform(shape=(2, 3, 32, 32))
@@ -1301,6 +1738,74 @@ def test_hook():
     assert hook_call_count == 1
     assert pre_hook_call_count == 2
 
+@with_seed()
+def test_op_hook_output_names():
+    def check_name(block, expected_names, inputs=None, expected_opr_names=None, monitor_all=False):
+        opr_names = []
+        output_names = []
+
+        def mon_callback(node_name, opr_name, arr):
+            output_names.append(py_str(node_name))
+            opr_names.append(py_str(opr_name))
+
+        block.register_op_hook(mon_callback, monitor_all)
+        if not inputs:
+            block(mx.nd.ones((2, 3, 4)))
+        else:
+            block(inputs)
+
+        for output_name, expected_name in zip(output_names, expected_names):
+            print(output_name)
+            assert output_name == expected_name
+
+        if expected_opr_names:
+            for opr_name, expected_opr_name in zip(opr_names, expected_opr_names):
+                assert opr_name == expected_opr_name
+
+    # Test with Dense layer
+    model = mx.gluon.nn.HybridSequential(prefix="dense_")
+    with model.name_scope():
+        model.add(mx.gluon.nn.Dense(2))
+    model.initialize()
+    model.hybridize()
+    check_name(model, ["dense_dense0_fwd_output"])
+
+    # Test with Activation, FListInputNames not registered, input name will have _input appended
+    model = mx.gluon.nn.HybridSequential(prefix="relu_")
+    with model.name_scope():
+        model.add(mx.gluon.nn.Activation("relu"))
+    model.initialize()
+    model.hybridize()
+    check_name(model, ["relu_relu0_fwd_output"])
+
+    # Test with Pooling, monitor_all is set to True
+    model = mx.gluon.nn.HybridSequential("pool_")
+    with model.name_scope():
+        model.add(mx.gluon.nn.AvgPool1D())
+    model.initialize()
+    model.hybridize()
+    check_name(model, ['pool_pool0_fwd_data', 'pool_pool0_fwd_output'], expected_opr_names=["Pooling"],
+               monitor_all=True)
+
+    # stack two layers and test
+    model = mx.gluon.nn.HybridSequential("dense_")
+    with model.name_scope():
+        model.add(mx.gluon.nn.Dense(2))
+        model.add(mx.gluon.nn.Activation("relu"))
+    model.initialize()
+    model.hybridize()
+    check_name(model,
+               ['dense_dense0_fwd_data', 'dense_dense0_fwd_weight',
+                'dense_dense0_fwd_bias', 'dense_dense0_fwd_output',
+                'dense_relu0_fwd_input0', 'dense_relu0_fwd_output'], monitor_all=True)
+
+    # check with different hybridize modes
+    model.hybridize(static_alloc=True)
+    check_name(model,
+               ['dense_dense0_fwd_data', 'dense_dense0_fwd_weight',
+                'dense_dense0_fwd_bias', 'dense_dense0_fwd_output',
+                'dense_relu0_fwd_input0', 'dense_relu0_fwd_output'], monitor_all=True)
+
 
 @with_seed()
 def test_apply():
@@ -1321,7 +1826,7 @@ def test_apply():
 
 
 @with_seed()
-@assert_raises_cudnn_disabled()
+@assert_raises_cudnn_not_satisfied(min_version='5.1.10')
 def test_summary():
     net = gluon.model_zoo.vision.resnet50_v1()
     net.initialize()
@@ -1932,7 +2437,6 @@ def test_reshape_batchnorm():
 
 
 @with_seed()
-@unittest.skip('Test failing, tracked by https://github.com/apache/incubator-mxnet/issues/12715')
 def test_slice_batchnorm():
     class Net(gluon.HybridBlock):
         def __init__(self, slice, **kwargs):
@@ -2092,31 +2596,41 @@ def test_reshape_pooling2d():
 
 @with_seed()
 def test_slice_pooling2d():
-    max_pooling = nn.MaxPool2D(strides=(2, 3), padding=(1, 1))
-    avg_pooling = nn.AvgPool2D(strides=(2, 2), padding=(1, 1))
-    global_maxpooling = nn.GlobalMaxPool2D()
-    global_avgpooling = nn.GlobalAvgPool2D()
-    pooling_layers = [max_pooling, avg_pooling, global_maxpooling, global_avgpooling]
-    class Net(gluon.HybridBlock):
-        def __init__(self,
-                     slice,
-                     pooling_layer,
-                     **kwargs):
-            super(Net, self).__init__(**kwargs)
-            with self.name_scope():
-                self.slice = slice
-                self.pool0 = pooling_layer
+    # transpose shape to bring feature dimension 'c' from 2nd position to last
+    def transpose(shape):
+        return (shape[0],) + shape[2:] + (shape[1],)
 
-        def hybrid_forward(self, F, x):
-            x_slice = x.slice(begin=self.slice[0], end=self.slice[1])
-            out = self.pool0(x_slice)
-            return out
+    for layout in ['NCHW', 'NHWC']:
+        max_pooling = nn.MaxPool2D(strides=(2, 3), padding=(1, 1), layout=layout)
+        avg_pooling = nn.AvgPool2D(strides=(2, 2), padding=(1, 1), layout=layout)
+        global_maxpooling = nn.GlobalMaxPool2D(layout=layout)
+        global_avgpooling = nn.GlobalAvgPool2D(layout=layout)
+        pooling_layers = [max_pooling, avg_pooling, global_maxpooling, global_avgpooling]
+        class Net(gluon.HybridBlock):
+            def __init__(self,
+                         slice,
+                         pooling_layer,
+                         **kwargs):
+                super(Net, self).__init__(**kwargs)
+                with self.name_scope():
+                    self.slice = slice
+                    self.pool0 = pooling_layer
 
-    x = mx.nd.random.uniform(shape=(16, 128, 256, 256))
-    slice = [(0, 0, 0, 0), (4, 16, 32, 64)]
-    for i in range(len(pooling_layers)):
-        net = Net(slice, pooling_layers[i])
-        check_layer_forward_withinput(net, x)
+            def hybrid_forward(self, F, x):
+                x_slice = x.slice(begin=self.slice[0], end=self.slice[1])
+                out = self.pool0(x_slice)
+                return out
+
+        xshape = (16, 128, 256, 256)
+        slice_shape = (4, 16, 32, 64)
+        if layout == 'NHWC':
+            xshape = transpose(xshape)
+            slice_shape = transpose(slice_shape)
+        x = mx.nd.random.uniform(shape=xshape)
+        slice = [(0, 0, 0, 0), slice_shape]
+        for i in range(len(pooling_layers)):
+            net = Net(slice, pooling_layers[i])
+            check_layer_forward_withinput(net, x)
 
 @with_seed()
 @unittest.skip('skippping temporarily, tracked by https://github.com/apache/incubator-mxnet/issues/11164')
@@ -2412,7 +2926,7 @@ def test_reshape_activation():
             x_reshape = x.reshape(self.reshape)
             out = self.act(x_reshape)
             return out
-    acts = ["relu", "sigmoid", "tanh", "softrelu"]
+    acts = ["relu", "sigmoid", "tanh", "softrelu", "softsign"]
     for act in acts:
         x = mx.nd.random.uniform(-1, 1, shape=(4, 16, 32, 32))
         shape = (4, 32, 32, -1)
@@ -2434,7 +2948,7 @@ def test_slice_activation():
             out = self.act(x_slice)
             return out
 
-    acts = ["relu", "sigmoid", "tanh", "softrelu"]
+    acts = ["relu", "sigmoid", "tanh", "softrelu", "softsign"]
     for act in acts:
         x = mx.nd.random.uniform(-1, 1, shape=(8, 32, 64, 64))
         slice = [(0, 16, 32, 32), (4, 32, 64, 64)]
@@ -2458,7 +2972,7 @@ def test_reshape_activation_reshape_activation():
             y_reshape = y.reshape(self.reshape[1])
             out = self.act1(y_reshape)
             return out
-    acts = ["relu", "sigmoid", "tanh", "softrelu"]
+    acts = ["relu", "sigmoid", "tanh", "softrelu", "softsign"]
     for idx0, act0 in enumerate(acts):
         for idx1, act1 in enumerate(acts):
             if idx1 == idx0:
@@ -2485,7 +2999,7 @@ def test_slice_activation_slice_activation():
             y_slice = y.slice(begin=self.slice[1][0], end=self.slice[1][1])
             out = self.act1(y_slice)
             return out
-    acts = ["relu", "sigmoid", "tanh", "softrelu"]
+    acts = ["relu", "sigmoid", "tanh", "softrelu", "softsign"]
     for idx0, act0 in enumerate(acts):
         for idx1, act1 in enumerate(acts):
             if idx1 == idx0:
@@ -2513,7 +3027,7 @@ def test_reshape_activation_slice_activation():
             y_slice = y.slice(begin=self.slice[0], end=self.slice[1])
             out = self.act1(y_slice)
             return out
-    acts = ["relu", "sigmoid", "tanh", "softrelu"]
+    acts = ["relu", "sigmoid", "tanh", "softrelu", "softsign"]
     for idx0, act0 in enumerate(acts):
         for idx1, act1 in enumerate(acts):
             if idx1 == idx0:
@@ -2542,7 +3056,7 @@ def test_slice_activation_reshape_activation():
             y_reshape = y.reshape(self.reshape)
             out = self.act1(y_reshape)
             return out
-    acts = ["relu", "sigmoid", "tanh", "softrelu"]
+    acts = ["relu", "sigmoid", "tanh", "softrelu", "softsign"]
     for idx0, act0 in enumerate(acts):
         for idx1, act1 in enumerate(acts):
             if idx1 == idx0:
@@ -2552,6 +3066,114 @@ def test_slice_activation_reshape_activation():
             shape = (4, 32, 32, -1)
             net = Net(act0, act1, shape, slice)
             check_layer_forward_withinput(net, x)
+
+@with_seed()
+def test_np_shape_parameters():
+    class Foo(gluon.Block):
+        def __init__(self, **kwargs):
+            super(Foo, self).__init__(**kwargs)
+            self.dense = gluon.nn.Dense(16)
+        def forward(self, x):
+            return self.dense(x)
+
+    with mx.np_shape(True):
+        z = mx.nd.zeros((2,2016))
+        print(z.shape)
+        foo = Foo()
+        foo.initialize()
+        print(foo(z).shape)
+
+@with_seed()
+def test_gluon_param_load():
+    net = mx.gluon.nn.Dense(10, in_units=10)
+    net.initialize()
+    net.save_parameters('test_gluon_param_load.params')
+    net.cast('float16')
+    net.load_parameters('test_gluon_param_load.params', cast_dtype=True)
+    mx.nd.waitall()
+
+@with_seed()
+def test_gluon_param_load_dtype_source():
+    net = mx.gluon.nn.Dense(10, in_units=10)
+    net.initialize()
+    net.cast('float16')
+    net.save_parameters('test_gluon_param_load_dtype_source.params')
+    net.cast('float32')
+    net.load_parameters('test_gluon_param_load_dtype_source.params', cast_dtype=True, dtype_source="saved")
+    assert net.weight.dtype == np.float16
+    mx.nd.waitall()
+
+@with_seed()
+def test_squeeze_consistency():
+    class Foo(gluon.HybridBlock):
+        def __init__(self, inplace, **kwargs):
+            super(Foo, self).__init__(**kwargs)
+            self.inplace = inplace
+
+        def forward(self, x):
+            return x.squeeze(inplace=self.inplace)
+
+    for inplace in (True, False):
+        block = Foo(inplace)
+        block.hybridize()
+        shape = (np.random.randint(1, 10), np.random.randint(1, 10), 1)
+        block(mx.nd.ones(shape))
+
+def test_shared_parameters_with_non_default_initializer():
+    class MyBlock(gluon.HybridBlock):
+        def __init__(self, **kwargs):
+            super(MyBlock, self).__init__(**kwargs)
+
+            with self.name_scope():
+                self.param = self.params.get("param", shape=(1, ), init=mx.init.Constant(-10.0))
+
+    bl = MyBlock()
+    bl2 = MyBlock(params=bl.collect_params())
+    assert bl.param is bl2.param
+    bl3 = MyBlock()
+    assert bl.param is not bl3.param
+    assert bl.param.init == bl3.param.init
+
+@with_seed()
+def test_reqs_switching_training_inference():
+    class Foo(gluon.HybridBlock):
+        def __init__(self, **kwargs):
+            super(Foo, self).__init__(**kwargs)
+
+        def hybrid_forward(self, F, x):
+            y = 2 * x
+            return F.sqrt(x) + F.sqrt(y)
+
+    f = Foo()
+    f.hybridize(static_alloc=True)
+    x = mx.nd.ones(shape=(10,10))
+    x.attach_grad()
+    x2 = mx.nd.ones(shape=x.shape) * 2
+    x2.attach_grad()
+
+    # Call first in training mode
+    with mx.autograd.record():
+        y = f(x)
+    y.backward()
+
+    grad1 = x.grad.asnumpy()
+
+    # Compute the gradient with some other input
+    with mx.autograd.record():
+        y = f(x2)
+    y.backward()
+
+    # Call inference mode
+    y = f(x)
+
+    # Call training mode again
+    with mx.autograd.record():
+        y = f(x)
+    y.backward()
+
+    grad2 = x.grad.asnumpy()
+
+    mx.test_utils.assert_almost_equal(grad1, grad2)
 
 if __name__ == '__main__':
     import nose

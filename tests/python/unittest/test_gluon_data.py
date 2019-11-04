@@ -28,6 +28,7 @@ from mxnet.gluon.data import DataLoader
 import mxnet.ndarray as nd
 from mxnet import context
 from mxnet.gluon.data.dataset import Dataset
+from mxnet.gluon.data.dataset import ArrayDataset
 
 @with_seed()
 def test_array_dataset():
@@ -77,6 +78,10 @@ def _dataset_transform_fn(x, y):
     """Named transform function since lambda function cannot be pickled."""
     return x, y
 
+def _dataset_transform_first_fn(x):
+    """Named transform function since lambda function cannot be pickled."""
+    return x
+
 @with_seed()
 def test_recordimage_dataset_with_data_loader_multiworker():
     recfile = prepare_record()
@@ -95,17 +100,13 @@ def test_recordimage_dataset_with_data_loader_multiworker():
         assert x.shape[0] == 1 and x.shape[3] == 3
         assert y.asscalar() == i
 
-    # try limit recursion depth
-    import sys
-    old_limit = sys.getrecursionlimit()
-    sys.setrecursionlimit(500)  # this should be smaller than any default value used in python
-    dataset = gluon.data.vision.ImageRecordDataset(recfile).transform(_dataset_transform_fn)
+    # with transform_first
+    dataset = gluon.data.vision.ImageRecordDataset(recfile).transform_first(_dataset_transform_first_fn)
     loader = gluon.data.DataLoader(dataset, 1, num_workers=5)
 
     for i, (x, y) in enumerate(loader):
         assert x.shape[0] == 1 and x.shape[3] == 3
         assert y.asscalar() == i
-    sys.setrecursionlimit(old_limit)
 
 @with_seed()
 def test_sampler():
@@ -156,9 +157,10 @@ class Dataset(gluon.data.Dataset):
 @with_seed()
 def test_multi_worker():
     data = Dataset()
-    loader = gluon.data.DataLoader(data, batch_size=1, num_workers=5)
-    for i, batch in enumerate(loader):
-        assert (batch.asnumpy() == i).all()
+    for thread_pool in [True, False]:
+        loader = gluon.data.DataLoader(data, batch_size=1, num_workers=5, thread_pool=thread_pool)
+        for i, batch in enumerate(loader):
+            assert (batch.asnumpy() == i).all()
 
 class _Dummy(Dataset):
     """Dummy dataset for randomized shape arrays."""
@@ -243,6 +245,125 @@ def test_multi_worker_forked_data_loader():
     for epoch in range(1):
         for i, data in enumerate(loader):
             pass
+
+@with_seed()
+def test_multi_worker_dataloader_release_pool():
+    # will trigger too many open file if pool is not released properly
+    if os.name == 'nt':
+        print('Skip for windows since spawn on windows is too expensive.')
+        return
+    for _ in range(10):
+        A = np.random.rand(999, 2000)
+        D = mx.gluon.data.DataLoader(A, batch_size=8, num_workers=8)
+        the_iter = iter(D)
+        next(the_iter)
+        del the_iter
+        del D
+
+
+def test_dataloader_context():
+    X = np.random.uniform(size=(10, 20))
+    dataset = gluon.data.ArrayDataset(X)
+    default_dev_id = 0
+    custom_dev_id = 1
+
+    # use non-pinned memory
+    loader1 = gluon.data.DataLoader(dataset, 8)
+    for _, x in enumerate(loader1):
+        assert x.context == context.cpu(default_dev_id)
+
+    # use pinned memory with default device id
+    loader2 = gluon.data.DataLoader(dataset, 8, pin_memory=True)
+    for _, x in enumerate(loader2):
+        assert x.context == context.cpu_pinned(default_dev_id)
+
+    # use pinned memory with custom device id
+    loader3 = gluon.data.DataLoader(dataset, 8, pin_memory=True,
+                                    pin_device_id=custom_dev_id)
+    for _, x in enumerate(loader3):
+        assert x.context == context.cpu_pinned(custom_dev_id)
+
+def batchify(a):
+    return a
+
+def test_dataset_filter():
+    length = 100
+    a = mx.gluon.data.SimpleDataset([i for i in range(length)])
+    a_filtered = a.filter(lambda x: x % 10 == 0)
+    assert(len(a_filtered) == 10)
+    for idx, sample in enumerate(a_filtered):
+        assert sample % 10 == 0
+    a_xform_filtered = a.transform(lambda x: x + 1).filter(lambda x: x % 10 == 0)
+    assert(len(a_xform_filtered) == 10)
+    # the filtered data is already transformed
+    for idx, sample in enumerate(a_xform_filtered):
+        assert sample % 10 == 0
+
+def test_dataset_shard():
+    length = 9
+    a = mx.gluon.data.SimpleDataset([i for i in range(length)])
+    shard_0 = a.shard(4, 0)
+    shard_1 = a.shard(4, 1)
+    shard_2 = a.shard(4, 2)
+    shard_3 = a.shard(4, 3)
+    assert len(shard_0) + len(shard_1) + len(shard_2) + len(shard_3) == length
+    assert len(shard_0) == 3
+    assert len(shard_1) == 2
+    assert len(shard_2) == 2
+    assert len(shard_3) == 2
+    total = 0
+    for shard in [shard_0, shard_1, shard_2, shard_3]:
+        for idx, sample in enumerate(shard):
+            total += sample
+    assert total == sum(a)
+
+def test_dataset_take():
+    length = 100
+    a = mx.gluon.data.SimpleDataset([i for i in range(length)])
+    a_take_full = a.take(1000)
+    assert len(a_take_full) == length
+    a_take_full = a.take(None)
+    assert len(a_take_full) == length
+    count = 10
+    a_take_10 = a.take(count)
+    assert len(a_take_10) == count
+    expected_total = sum([i for i in range(count)])
+    total = 0
+    for idx, sample in enumerate(a_take_10):
+        assert sample < count
+        total += sample
+    assert total == expected_total
+
+    a_xform_take_10 = a.transform(lambda x: x * 10).take(count)
+    assert len(a_xform_take_10) == count
+    expected_total = sum([i * 10 for i in range(count)])
+    total = 0
+    for idx, sample in enumerate(a_xform_take_10):
+        assert sample < count * 10
+        total += sample
+    assert total == expected_total
+
+def test_dataloader_scope():
+    """
+    Bug: Gluon DataLoader terminates the process pool early while
+    _MultiWorkerIter is operating on the pool.
+
+    Tests that DataLoader is not garbage collected while the iterator is
+    in use.
+    """
+    args = {'num_workers': 1, 'batch_size': 2}
+    dataset = nd.ones(5)
+    iterator = iter(DataLoader(
+            dataset,
+            batchify_fn=batchify,
+            **args
+        )
+    )
+
+    item = next(iterator)
+
+    assert item is not None
+
 
 if __name__ == '__main__':
     import nose

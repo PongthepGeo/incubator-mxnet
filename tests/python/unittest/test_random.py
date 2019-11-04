@@ -19,12 +19,13 @@ import os
 import math
 import itertools
 import mxnet as mx
-from mxnet.test_utils import verify_generator, gen_buckets_probs_with_ppf, retry
+from mxnet.test_utils import verify_generator, gen_buckets_probs_with_ppf, retry, assert_almost_equal
 import numpy as np
 import random as rnd
 from common import setup_module, with_seed, random_seed, teardown
 import scipy.stats as ss
 import unittest
+from mxnet.test_utils import *
 
 def same(a, b):
     return np.sum(a != b) == 0
@@ -38,6 +39,9 @@ def check_with_device(device, dtype):
             'name': 'normal',
             'symbol': mx.sym.random.normal,
             'ndop': mx.nd.random.normal,
+            'pdfsymbol': mx.sym.random_pdf_normal,
+            'pdffunc': ss.norm.pdf,
+            'discrete': False,
             'params': { 'loc': 10.0, 'scale': 0.5 },
             'inputs': [ ('loc',[ [ 0.0, 2.5 ], [ -9.75, -7.0 ] ]) , ('scale',[ [ 1.0, 3.7 ], [ 4.2, 1.5 ] ]) ],
             'checks': [
@@ -46,9 +50,21 @@ def check_with_device(device, dtype):
             ]
         },
         {
+            'name': 'normal_like',
+            'symbol': mx.sym.random.normal_like,
+            'ndop': mx.nd.random.normal_like,
+            'params': { 'loc': 10.0, 'scale': 0.5 },
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64) - params['loc']),  tol),
+                ('std',  lambda x, params: np.std(x.astype(np.float64)) - params['scale'], tol)
+            ]
+        },
+        {
             'name': 'randn',
+            'symbol': mx.sym.random.randn,
             'ndop': mx.nd.random.randn,
             'params': { 'loc': 10.0, 'scale': 0.5 },
+            'inputs': [ ('loc',[ [ 0.0, 2.5 ], [ -9.75, -7.0 ] ]) , ('scale',[ [ 1.0, 3.7 ], [ 4.2, 1.5 ] ]) ],
             'checks': [
                 ('mean', lambda x, params: np.mean(x.astype(np.float64) - params['loc']),  tol),
                 ('std',  lambda x, params: np.std(x.astype(np.float64)) - params['scale'], tol)
@@ -58,6 +74,9 @@ def check_with_device(device, dtype):
             'name': 'uniform',
             'symbol': mx.sym.random.uniform,
             'ndop': mx.nd.random.uniform,
+            'pdfsymbol': mx.sym.random_pdf_uniform,
+            'pdffunc': lambda x, low, high: ss.uniform.pdf(x, low, high-low),
+            'discrete': False,
             'params': { 'low': -1.5, 'high': 3.0 },
             'inputs': [ ('low', [ [ 0.0, 2.5 ], [ -9.75, -1.0 ] ]) , ('high', [ [ 1.0, 3.7 ], [ 4.2, 10.5 ] ]) ],
             'checks': [
@@ -66,65 +85,143 @@ def check_with_device(device, dtype):
             ]
         },
         {
-                'name': 'gamma',
-                'symbol': mx.sym.random.gamma,
-                'ndop': mx.nd.random.gamma,
-                'params': { 'alpha': 9.0, 'beta': 0.5 },
-                'inputs': [ ('alpha', [ [ 0.0, 2.5 ], [ 9.75, 11.0 ] ]) , ('beta', [ [ 1.0, 0.7 ], [ 0.5, 0.3 ] ]) ],
-                'checks': [
-                    ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['alpha'] * params['beta'], tol),
-                    ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['alpha'] * params['beta'] ** 2), tol)
-                ]
-            },
-            {
-                'name': 'exponential',
-                'symbol': mx.sym.random.exponential,
-                'ndop': mx.nd.random.exponential,
-                'params': { 'scale': 1.0/4.0 },
-                'inputs': [ ('scale', [ [ 1.0/1.0, 1.0/8.5 ], [ 1.0/2.7 , 1.0/0.5 ] ]) ],
-                'checks': [
-                    ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['scale'], tol),
-                    ('std', lambda x, params: np.std(x.astype(np.float64)) - params['scale'], tol)
-                ]
-            },
-            {
-                'name': 'poisson',
-                'symbol': mx.sym.random.poisson,
-                'ndop': mx.nd.random.poisson,
-                'params': { 'lam': 4.0 },
-                'inputs': [ ('lam', [ [ 25.0, 8.5 ], [ 2.7 , 0.5 ] ]) ],
-                'checks': [
-                    ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['lam'], tol),
-                    ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['lam']), tol)
-                ]
-            },
-            {
-                'name': 'neg-binomial',
-                'symbol': mx.sym.random.negative_binomial,
-                'ndop': mx.nd.random.negative_binomial,
-                'params': { 'k': 3, 'p': 0.4 },
-                'inputs': [ ('k', [ [ 3, 4 ], [ 5 , 6 ] ]) , ('p', [ [ 0.4 , 0.77 ], [ 0.5, 0.84 ] ]) ],
-                'checks': [
-                    ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['k'] * (1.0 - params['p']) /  params['p'], tol),
-                    ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['k'] * (1.0 - params['p']))/params['p'], tol)
-                ]
-            },
-            {
-                'name': 'gen-neg-binomial',
-                'symbol': mx.sym.random.generalized_negative_binomial,
-                'ndop': mx.nd.random.generalized_negative_binomial,
-                'params': { 'mu': 2.0, 'alpha': 0.3 },
-                'inputs': [ ('mu', [ [ 2.0, 2.5 ], [ 1.3, 1.9 ] ]) , ('alpha', [ [ 1.0, 0.1 ], [ 0.2, 0.5 ] ]) ],
-                'checks': [
-                    ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['mu'], tol),
-                    ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['mu'] + params['alpha'] * params['mu'] ** 2 ), tol)
-                ]
-            }
+            'name': 'uniform_like',
+            'symbol': mx.sym.random.uniform_like,
+            'ndop': mx.nd.random.uniform_like,
+            'params': { 'low': -1.5, 'high': 3.0 },
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - (params['low'] + params['high']) / 2.0, tol),
+                ('std', lambda x,  params: np.std(x.astype(np.float64)) - np.sqrt(1.0 / 12.0) * (params['high'] - params['low']), tol)
+            ]
+        },
+        {
+            'name': 'gamma',
+            'symbol': mx.sym.random.gamma,
+            'ndop': mx.nd.random.gamma,
+            'pdfsymbol': mx.sym.random_pdf_gamma,
+            'pdffunc': lambda x, alpha, beta: ss.gamma.pdf(x, alpha, 0, 1/beta),
+            'discrete': False,
+            'params': { 'alpha': 9.0, 'beta': 0.5 },
+            'inputs': [ ('alpha', [ [ 0.1, 2.5 ], [ 9.75, 11.0 ] ]) , ('beta', [ [ 1.0, 0.7 ], [ 0.5, 0.3 ] ]) ],
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['alpha'] * params['beta'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['alpha'] * params['beta'] ** 2), tol)
+            ]
+        },
+        {
+            'name': 'gamma_like',
+            'symbol': mx.sym.random.gamma_like,
+            'ndop': mx.nd.random.gamma_like,
+            'params': { 'alpha': 9.0, 'beta': 0.5 },
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['alpha'] * params['beta'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['alpha'] * params['beta'] ** 2), tol)
+            ]
+        },
+        {
+            'name': 'exponential',
+            'symbol': mx.sym.random.exponential,
+            'ndop': mx.nd.random.exponential,
+            'pdfsymbol': mx.sym.random_pdf_exponential,
+            'pdffunc': lambda x, lam: ss.expon.pdf(x, 0, 1/lam),
+            'discrete': False,
+            'params': { 'scale': 1.0/4.0 },
+            'inputs': [ ('scale', [ [ 1.0/1.0, 1.0/8.5 ], [ 1.0/2.7 , 1.0/0.5 ] ]) ],
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['scale'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - params['scale'], tol)
+            ]
+        },
+        {
+            'name': 'exponential_like',
+            'symbol': mx.sym.random.exponential_like,
+            'ndop': mx.nd.random.exponential_like,
+            'params': { 'lam': 4.0 },
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - 1.0/params['lam'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - 1.0/params['lam'], tol)
+            ]
+        },
+        {
+            'name': 'poisson',
+            'symbol': mx.sym.random.poisson,
+            'ndop': mx.nd.random.poisson,
+            'pdfsymbol': mx.sym.random_pdf_poisson,
+            'pdffunc': ss.poisson.pmf,
+            'discrete': True,
+            'params': { 'lam': 4.0 },
+            'inputs': [ ('lam', [ [ 25.0, 8.5 ], [ 2.7 , 0.5 ] ]) ],
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['lam'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['lam']), tol)
+            ]
+        },
+        {
+            'name': 'poisson_like',
+            'symbol': mx.sym.random.poisson_like,
+            'ndop': mx.nd.random.poisson_like,
+            'params': { 'lam': 4.0 },
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['lam'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['lam']), tol)
+            ]
+        },
+        {
+            'name': 'neg_binomial',
+            'symbol': mx.sym.random.negative_binomial,
+            'ndop': mx.nd.random.negative_binomial,
+            'pdfsymbol': mx.sym.random_pdf_negative_binomial,
+            'pdffunc': ss.nbinom.pmf,
+            'discrete': True,
+            'params': { 'k': 3, 'p': 0.4 },
+            'inputs': [ ('k', [ [ 3, 4 ], [ 5 , 6 ] ]) , ('p', [ [ 0.4 , 0.77 ], [ 0.5, 0.84 ] ]) ],
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['k'] * (1.0 - params['p']) /  params['p'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['k'] * (1.0 - params['p']))/params['p'], tol)
+            ]
+        },
+        {
+            'name': 'neg_binomial_like',
+            'symbol': mx.sym.random.negative_binomial_like,
+            'ndop': mx.nd.random.negative_binomial_like,
+            'params': { 'k': 3, 'p': 0.4 },
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['k'] * (1.0 - params['p']) /  params['p'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['k'] * (1.0 - params['p']))/params['p'], tol)
+            ]
+        },
+        {
+            'name': 'gen_neg_binomial',
+            'symbol': mx.sym.random.generalized_negative_binomial,
+            'ndop': mx.nd.random.generalized_negative_binomial,
+            'pdfsymbol': mx.sym.random_pdf_generalized_negative_binomial,
+            'pdffunc': lambda x, mu, alpha: ss.nbinom.pmf(x, 1.0/alpha, 1.0/(mu*alpha+1.0)),
+            'discrete': True,
+            'params': { 'mu': 2.0, 'alpha': 0.3 },
+            'inputs': [ ('mu', [ [ 2.0, 2.5 ], [ 1.3, 1.9 ] ]) , ('alpha', [ [ 1.0, 0.1 ], [ 0.2, 0.5 ] ]) ],
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['mu'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['mu'] + params['alpha'] * params['mu'] ** 2 ), tol)
+            ]
+        },
+        {
+            'name': 'gen_neg_binomial_like',
+            'symbol': mx.sym.random.generalized_negative_binomial_like,
+            'ndop': mx.nd.random.generalized_negative_binomial_like,
+            'params': { 'mu': 2.0, 'alpha': 0.3 },
+            'checks': [
+                ('mean', lambda x, params: np.mean(x.astype(np.float64)) - params['mu'], tol),
+                ('std', lambda x, params: np.std(x.astype(np.float64)) - np.sqrt(params['mu'] + params['alpha'] * params['mu'] ** 2 ), tol)
+            ]
+        },
 
-        ]
+    ]
 
     # Create enough samples such that we get a meaningful distribution.
     shape = (500, 500)
+    # Test pdf on smaller shapes as backward checks will take too long otherwise.
+    # This must be a subshape of the former one.
+    pdfshape = (30, 30)
     for symbdic in symbols:
         name = symbdic['name']
         ndop = symbdic['ndop']
@@ -136,6 +233,10 @@ def check_with_device(device, dtype):
         if name == 'randn':
             params.pop('shape')  # randn does not accept shape param
             args = shape
+        if name.endswith('_like'):
+            params['data'] = mx.nd.ones(params.pop('shape'),
+                                        dtype=params.pop('dtype'),
+                                        ctx=params.pop('ctx'))
         mx.random.seed(128)
         ret1 = ndop(*args, **params).asnumpy()
         mx.random.seed(128)
@@ -151,6 +252,9 @@ def check_with_device(device, dtype):
 
         params = {'shape': shape, 'dtype': dtype, 'ctx': device}
         params.update({k : mx.nd.array(v, ctx=device, dtype=dtype) for k, v in symbdic['inputs']})
+        if name == 'randn':
+            params.pop('shape')  # randn does not accept shape param
+            args = shape
         mx.random.seed(128)
         ret1 = ndop(*args, **params).asnumpy()
         mx.random.seed(128)
@@ -164,13 +268,13 @@ def check_with_device(device, dtype):
                     err = np.abs(check_func(ret2[i,j], stats))
                     assert err < tol, "%f vs %f: symbolic test: %s check for `%s` did not pass" % (err, tol, check_name, name)
 
-        if 'symbol' not in symbdic: continue  # randn does not have symbol
-
         # check symbolic
         symbol = symbdic['symbol']
         X = mx.sym.Variable("X")
         params = symbdic['params'].copy()
         params.update(shape=shape, dtype=dtype)
+        if name.endswith('_like') or name == 'randn':
+            params['data'] = mx.sym.ones(params.pop('shape'))
         Y = symbol(**params) + X
         x = mx.nd.zeros(shape, dtype=dtype, ctx=device)
         xgrad = mx.nd.zeros(shape, dtype=dtype, ctx=device)
@@ -189,14 +293,20 @@ def check_with_device(device, dtype):
         ret1 = un1.asnumpy()
         for check_name, check_func, tol in symbdic['checks']:
             assert np.abs(check_func(ret1, params)) < tol, "symbolic test: %s check for `%s` did not pass" % (check_name, name)
+        if name.endswith('_like'): continue
 
         # check multi-distribution sampling
         symbol = symbdic['symbol']
         params = { 'shape' : shape, 'dtype' : dtype }
-        single_param = len(symbdic['inputs']) == 1;
+        single_param = len(symbdic['inputs']) == 1
         v1 = mx.sym.Variable('v1')
         v2 = mx.sym.Variable('v2')
-        Y = symbol(v1,**params) if single_param else symbol(v1,v2,**params)
+        if name == 'randn':
+            params.pop('shape')  # randn does not accept shape param
+            args=shape
+            Y = symbol(v1, **params) if single_param else symbol(*args, loc=v1, scale=v2,**params)
+        else:
+            Y = symbol(v1,**params) if single_param else symbol(v1,v2,**params)
         bindings = { 'v1' : mx.nd.array(symbdic['inputs'][0][1]) }
         if not single_param :
             bindings.update({ 'v2' : mx.nd.array(symbdic['inputs'][1][1]) })
@@ -213,12 +323,84 @@ def check_with_device(device, dtype):
                 for check_name, check_func, tol in symbdic['checks']:
                     assert np.abs(check_func(samples, params)) < tol, "symbolic test: %s check for `%s` did not pass" % (check_name, name)
 
-@with_seed()
-def test_random():
-    check_with_device(mx.context.current_context(), 'float16')
-    check_with_device(mx.context.current_context(), 'float32')
-    check_with_device(mx.context.current_context(), 'float64')
+        if 'pdfsymbol' not in symbdic: continue  # randn not tested for pdf
 
+        # check pdfs with only a subset of the generated samples
+        un1 = np.resize(un1, (un1.shape[0], un1.shape[1], pdfshape[0], pdfshape[1]))
+        symbol  = symbdic['pdfsymbol']
+        pdffunc = symbdic['pdffunc']
+        v0 = mx.sym.Variable('v0')
+        v1 = mx.sym.Variable('v1')
+        v2 = mx.sym.Variable('v2')
+        p1 = np.array(symbdic['inputs'][0][1])
+        p2 = None if single_param else np.array(symbdic['inputs'][1][1])
+        # Move samples away from boundaries of support
+        if name == 'gamma' or name == 'exponential':
+           un1 = np.maximum(un1, 1e-1)
+        if name == 'uniform':
+           un1 = np.minimum(np.maximum(un1.reshape((un1.shape[0],un1.shape[1],-1)), p1.reshape((p1.shape[0],p1.shape[1],-1))+1e-4),
+                            p2.reshape((p2.shape[0],p2.shape[1],-1))-1e-4).reshape(un1.shape) 
+        for use_log in [False, True]:
+            test_pdf = symbol(v0, v1, is_log=use_log) if single_param else symbol(v0, v1, v2, is_log=use_log)
+            forw_atol  = 1e-7 if dtype != np.float16 else 1e-3
+            forw_rtol  = 1e-4 if dtype != np.float16 else 5e-2
+            backw_atol = 1e-3
+            backw_rtol = 5e-2
+            if single_param:
+                res = pdffunc(un1.reshape((un1.shape[0],un1.shape[1],-1)),
+                    p1.reshape((p1.shape[0],p1.shape[1],-1))).reshape(un1.shape)
+                if use_log: 
+                    res = np.log(res)
+                check_symbolic_forward(test_pdf, [un1, p1], [res], atol=forw_atol, rtol=forw_rtol, dtype=dtype)
+                if dtype == np.float64:
+                  grad_nodes = ['v1'] if symbdic['discrete'] else ['v0', 'v1']
+                  check_numeric_gradient(test_pdf, [un1, p1], grad_nodes=grad_nodes, atol=backw_atol, rtol=backw_rtol, dtype=dtype)
+            else:
+                res = pdffunc(un1.reshape((un1.shape[0],un1.shape[1],-1)),
+                    p1.reshape((p1.shape[0],p1.shape[1],-1)),
+                    p2.reshape((p2.shape[0],p2.shape[1],-1))).reshape(un1.shape)
+                if use_log:
+                    res = np.log(res)
+                check_symbolic_forward(test_pdf, [un1, p1, p2], [res], atol=forw_atol, rtol=forw_rtol, dtype=dtype)
+                if dtype == np.float64:
+                  grad_nodes = ['v1', 'v2'] if symbdic['discrete'] else ['v0', 'v1', 'v2']
+                  check_numeric_gradient(test_pdf, [un1, p1, p2], grad_nodes=grad_nodes, atol=backw_atol, rtol=backw_rtol, dtype=dtype)
+
+@with_seed(1000)
+def test_dirichlet():
+    num_classes = 2
+    num = 100
+    alpha = np.random.uniform(low=0.5, high=2, size=(4, num_classes))
+
+    samples = []
+    results = []
+    for a in alpha:
+        v = ss.dirichlet.rvs(a, size=num)
+        samples.append(v)
+        results.append(ss.dirichlet.logpdf(v.transpose(), a))
+    samples = np.concatenate(samples, axis=0).reshape((2, 2, num, num_classes))
+    results = np.concatenate(results, axis=0).reshape((2, 2, num))
+
+    alpha = alpha.reshape((2, 2, num_classes))
+
+    for dtype in [np.float32, np.float64]:
+        forw_atol  = 1e-5
+        forw_rtol  = 1e-4
+        for use_log in [False, True]:
+            v0 = mx.sym.Variable('v0')
+            v1 = mx.sym.Variable('v1')
+            test_pdf = mx.sym.random_pdf_dirichlet(v0, v1, is_log=use_log)
+            res = results if use_log else np.exp(results)
+            check_symbolic_forward(test_pdf, [samples, alpha], [res], atol=forw_atol, rtol=forw_rtol, dtype=dtype)
+            if dtype == np.float64:
+                backw_atol = 1e-2
+                backw_rtol = 1e-2
+                eps = 1e-5
+                check_numeric_gradient(test_pdf, [samples, alpha], numeric_eps=eps, atol=backw_atol, rtol=backw_rtol, dtype=dtype)
+
+def test_random():
+    for dtype in [np.float16, np.float32, np.float64]:
+        check_with_device(mx.context.current_context(), dtype)
 
 # Set seed variously based on `start_seed` and `num_init_seeds`, then set seed finally to `final_seed`
 def set_seed_variously(init_seed, num_init_seeds, final_seed):
@@ -259,6 +441,7 @@ def test_parallel_random_seed_setting():
         # Avoid excessive test cpu runtimes
         num_temp_seeds = 25 if ctx.device_type == 'gpu' else 1
         # To flush out a possible race condition, run multiple times
+
         for _ in range(20):
             # Create enough samples such that we get a meaningful distribution.
             shape = (200, 200)
@@ -400,14 +583,14 @@ def test_sample_multinomial():
                 prob = prob.reshape((1, prob.shape[0]))
             for i in range(x.shape[0]):
                 freq = np.bincount(y[i,:].astype('int32'), minlength=5)/np.float32(samples)*x[i,:].sum()
-                mx.test_utils.assert_almost_equal(freq, x[i], rtol=0.20, atol=1e-1)
+                assert_almost_equal(freq, x[i], rtol=0.20, atol=1e-1)
                 rprob = x[i][y[i].astype('int32')]/x[i].sum()
-                mx.test_utils.assert_almost_equal(np.log(rprob), prob.asnumpy()[i], atol=1e-5)
+                assert_almost_equal(np.log(rprob), prob.asnumpy()[i], atol=1e-5)
 
                 real_dx = np.zeros((5,))
                 for j in range(samples):
                     real_dx[int(y[i][j])] += 5.0 / rprob[j]
-                mx.test_utils.assert_almost_equal(real_dx, dx[i, :], rtol=1e-4, atol=1e-5)
+                assert_almost_equal(real_dx, dx[i, :], rtol=1e-4, atol=1e-5)
     for dtype in ['uint8', 'float16', 'float32']:
         # Bound check for the output data types. 'int32' and 'float64' require large memory so are skipped.
         x = mx.nd.zeros(2 ** 25)  # Larger than the max integer in float32 without precision loss.
@@ -428,7 +611,6 @@ def test_normal_generator():
     num_buckets = 5
     for dtype in ['float16', 'float32', 'float64']:
         for mu, sigma in [(0.0, 1.0), (1.0, 5.0)]:
-            print("ctx=%s, dtype=%s, Mu=%g, Sigma=%g:" % (ctx, dtype, mu, sigma))
             buckets, probs = gen_buckets_probs_with_ppf(lambda x: ss.norm.ppf(x, mu, sigma), num_buckets)
             # Quantize bucket boundaries to reflect the actual dtype and adjust probs accordingly
             buckets = np.array(buckets, dtype=dtype).tolist()
@@ -449,7 +631,6 @@ def test_uniform_generator():
     ctx = mx.context.current_context()
     for dtype in ['float16', 'float32', 'float64']:
         for low, high in [(-1.0, 1.0), (1.0, 3.0)]:
-            print("ctx=%s, dtype=%s, Low=%g, High=%g:" % (ctx, dtype, low, high))
             scale = high - low
             buckets, probs = gen_buckets_probs_with_ppf(lambda x: ss.uniform.ppf(x, loc=low, scale=scale), 5)
             # Quantize bucket boundaries to reflect the actual dtype and adjust probs accordingly
@@ -469,7 +650,6 @@ def test_gamma_generator():
     ctx = mx.context.current_context()
     for dtype in ['float16', 'float32', 'float64']:
         for kappa, theta in [(0.5, 1.0), (1.0, 5.0)]:
-            print("ctx=%s, dtype=%s, Shape=%g, Scale=%g:" % (ctx, dtype, kappa, theta))
             buckets, probs = gen_buckets_probs_with_ppf(lambda x: ss.gamma.ppf(x, a=kappa, loc=0, scale=theta), 5)
             generator_mx = lambda x: mx.nd.random.gamma(kappa, theta, shape=x, ctx=ctx, dtype=dtype).asnumpy()
             verify_generator(generator=generator_mx, buckets=buckets, probs=probs, success_rate=success_rate)
@@ -484,22 +664,20 @@ def test_exponential_generator():
     ctx = mx.context.current_context()
     for dtype in ['float16', 'float32', 'float64']:
         for scale in [0.1, 1.0]:
-            print("ctx=%s, dtype=%s, Scale=%g:" % (ctx, dtype, scale))
             buckets, probs = gen_buckets_probs_with_ppf(lambda x: ss.expon.ppf(x, loc=0, scale=scale), 5)
             generator_mx = lambda x: mx.nd.random.exponential(scale, shape=x, ctx=ctx, dtype=dtype).asnumpy()
-            verify_generator(generator=generator_mx, buckets=buckets, probs=probs)
+            verify_generator(generator=generator_mx, buckets=buckets, probs=probs, success_rate=0.20)
             generator_mx_same_seed = \
                 lambda x: np.concatenate(
                     [mx.nd.random.exponential(scale, shape=x // 10, ctx=ctx, dtype=dtype).asnumpy()
                      for _ in range(10)])
-            verify_generator(generator=generator_mx_same_seed, buckets=buckets, probs=probs)
+            verify_generator(generator=generator_mx_same_seed, buckets=buckets, probs=probs, success_rate=0.20)
 
 @with_seed()
 def test_poisson_generator():
     ctx = mx.context.current_context()
     for dtype in ['float16', 'float32', 'float64']:
         for lam in [1, 10]:
-            print("ctx=%s, dtype=%s, Lambda=%d:" % (ctx, dtype, lam))
             buckets = [(-1.0, lam - 0.5), (lam - 0.5, 2 * lam + 0.5), (2 * lam + 0.5, np.inf)]
             probs = [ss.poisson.cdf(bucket[1], lam) - ss.poisson.cdf(bucket[0], lam) for bucket in buckets]
             generator_mx = lambda x: mx.nd.random.poisson(lam, shape=x, ctx=ctx, dtype=dtype).asnumpy()
@@ -516,7 +694,6 @@ def test_negative_binomial_generator():
     for dtype in ['float16', 'float32', 'float64']:
         success_num = 2
         success_prob = 0.2
-        print("ctx=%s, dtype=%s, Success Num=%d:, Success Prob=%g" % (ctx, dtype, success_num, success_prob))
         buckets = [(-1.0, 2.5), (2.5, 5.5), (5.5, 8.5), (8.5, np.inf)]
         probs = [ss.nbinom.cdf(bucket[1], success_num, success_prob) -
                  ss.nbinom.cdf(bucket[0], success_num, success_prob) for bucket in buckets]
@@ -529,7 +706,6 @@ def test_negative_binomial_generator():
                  for _ in range(10)])
         verify_generator(generator=generator_mx_same_seed, buckets=buckets, probs=probs)
         # Also test the Gamm-Poisson Mixture
-        print('Gamm-Poisson Mixture Test:')
         alpha = 1.0 / success_num
         mu = (1.0 - success_prob) / success_prob / alpha
         generator_mx = lambda x: mx.nd.random.generalized_negative_binomial(mu, alpha,
@@ -566,19 +742,23 @@ def test_multinomial_generator():
     trials = 5
     buckets = list(range(6))
     for dtype in ['float16', 'float32', 'float64']:
-        print("ctx=%s, dtype=%s" %(ctx, dtype))
         quantized_probs = quantize_probs(probs, dtype)
         generator_mx = lambda x: mx.nd.random.multinomial(data=mx.nd.array(quantized_probs, ctx=ctx, dtype=dtype),
                                                           shape=x).asnumpy()
+        # success_rate was set to 0.15 since PR #13498 and became flaky
+        # both of previous issues(#14457, #14158) failed with success_rate 0.25
+        # In func verify_generator inside test_utilis.py
+        # it raise the error when success_num(1) < nrepeat(5) * success_rate(0.25)
+        # by changing the 0.25 -> 0.2 solve these edge case but still have strictness
         verify_generator(generator=generator_mx, buckets=buckets, probs=quantized_probs,
-                         nsamples=samples, nrepeat=trials)
+                         nsamples=samples, nrepeat=trials, success_rate=0.20)
         generator_mx_same_seed = \
             lambda x: np.concatenate(
                 [mx.nd.random.multinomial(data=mx.nd.array(quantized_probs, ctx=ctx, dtype=dtype),
                                                           shape=x // 10).asnumpy()
                  for _ in range(10)])
         verify_generator(generator=generator_mx_same_seed, buckets=buckets, probs=quantized_probs,
-                         nsamples=samples, nrepeat=trials)
+                         nsamples=samples, nrepeat=trials, success_rate=0.20)
 
 
 @with_seed()
@@ -600,7 +780,7 @@ def test_with_random_seed():
         with random_seed(seed):
             python_data = [rnd.random() for _ in range(size)]
             np_data = np.random.rand(size)
-            mx_data = mx.nd.random_uniform(shape=shape, ctx=ctx).asnumpy()
+            mx_data = mx.random.uniform(shape=shape, ctx=ctx).asnumpy()
         return (seed, python_data, np_data, mx_data)
 
     # check data, expecting them to be the same or different based on the seeds
@@ -643,6 +823,32 @@ def test_with_random_seed():
             check_data(data[i],data[j])
 
 @with_seed()
+def test_random_seed():
+    shape = (5, 5)
+    seed = rnd.randint(-(1 << 31), (1 << 31))
+
+    def _assert_same_mx_arrays(a, b):
+        assert len(a) == len(b)
+        for a_i, b_i in zip(a, b):
+            assert (a_i.asnumpy() == b_i.asnumpy()).all()
+
+    N = 100
+    mx.random.seed(seed)
+    v1 = [mx.random.uniform(shape=shape) for _ in range(N)]
+
+    mx.random.seed(seed)
+    v2 = [mx.random.uniform(shape=shape) for _ in range(N)]
+    _assert_same_mx_arrays(v1, v2)
+
+    try:
+        long
+        mx.random.seed(long(seed))
+        v3 = [mx.random.uniform(shape=shape) for _ in range(N)]
+        _assert_same_mx_arrays(v1, v3)
+    except NameError:
+        pass
+
+@with_seed()
 def test_unique_zipfian_generator():
     ctx = mx.context.current_context()
     if ctx.device_type == 'cpu':
@@ -677,8 +883,8 @@ def test_zipfian_generator():
     # test ndarray
     true_classes = mx.nd.random.uniform(0, range_max, shape=(num_true,)).astype('int32')
     sampled_classes, exp_cnt_true, exp_cnt_sampled = mx.nd.contrib.rand_zipfian(true_classes, num_sampled, range_max)
-    mx.test_utils.assert_almost_equal(exp_cnt_sampled.asnumpy(), exp_cnt[sampled_classes].asnumpy(), rtol=1e-1, atol=1e-2)
-    mx.test_utils.assert_almost_equal(exp_cnt_true.asnumpy(), exp_cnt[true_classes].asnumpy(), rtol=1e-1, atol=1e-2)
+    assert_almost_equal(exp_cnt_sampled, exp_cnt[sampled_classes], rtol=1e-1, atol=1e-2)
+    assert_almost_equal(exp_cnt_true, exp_cnt[true_classes], rtol=1e-1, atol=1e-2)
 
     # test symbol
     true_classes_var = mx.sym.var('true_classes')
@@ -687,22 +893,23 @@ def test_zipfian_generator():
     executor = outputs.bind(mx.context.current_context(), {'true_classes' : true_classes})
     executor.forward()
     sampled_classes, exp_cnt_true, exp_cnt_sampled = executor.outputs
-    mx.test_utils.assert_almost_equal(exp_cnt_sampled.asnumpy(), exp_cnt[sampled_classes].asnumpy(), rtol=1e-1, atol=1e-2)
-    mx.test_utils.assert_almost_equal(exp_cnt_true.asnumpy(), exp_cnt[true_classes].asnumpy(), rtol=1e-1, atol=1e-2)
+    assert_almost_equal(exp_cnt_sampled, exp_cnt[sampled_classes], rtol=1e-1, atol=1e-2)
+    assert_almost_equal(exp_cnt_true, exp_cnt[true_classes], rtol=1e-1, atol=1e-2)
 
 # Issue #10277 (https://github.com/apache/incubator-mxnet/issues/10277) discusses this test.
 @with_seed()
 def test_shuffle():
     def check_first_axis_shuffle(arr):
         stride = int(arr.size / arr.shape[0])
-        column0 = arr.reshape((arr.size,))[::stride].sort()
+        column0 = arr.reshape((arr.size,))[::stride]
         seq = mx.nd.arange(0, arr.size - stride + 1, stride, ctx=arr.context)
-        assert (column0 == seq).prod() == 1
-        for i in range(arr.shape[0]):
-            subarr = arr[i].reshape((arr[i].size,))
-            start = subarr[0].asscalar()
-            seq = mx.nd.arange(start, start + stride, ctx=arr.context)
-            assert (subarr == seq).prod() == 1
+        assert (column0.sort() == seq).prod() == 1
+        # Check for ascending flattened-row sequences for 2D or greater inputs.
+        if stride > 1:
+            ascending_seq = mx.nd.arange(0, stride, ctx=arr.context)
+            equalized_columns = arr.reshape((arr.shape[0], stride)) - ascending_seq
+            column0_2d = column0.reshape((arr.shape[0],1))
+            assert (column0_2d == equalized_columns).prod() == 1
 
     # This tests that the shuffling is along the first axis with `repeat1` number of shufflings
     # and the outcomes are uniformly distributed with `repeat2` number of shufflings.
@@ -766,6 +973,68 @@ def test_shuffle():
     # Test larger arrays
     testLarge(mx.nd.arange(0, 100000).reshape((10, 10000)), 10)
     testLarge(mx.nd.arange(0, 100000).reshape((10000, 10)), 10)
+    testLarge(mx.nd.arange(0, 100000), 10)
+
+
+@with_seed()
+def test_randint():
+    dtypes = ['int32', 'int64']
+    for dtype in dtypes:
+        params = {
+            'low': -1,
+            'high': 3,
+            'shape' : (500, 500),
+            'dtype' : dtype,
+            'ctx' : mx.context.current_context()
+            }
+        mx.random.seed(128)
+        ret1 = mx.nd.random.randint(**params).asnumpy()
+        mx.random.seed(128)
+        ret2 = mx.nd.random.randint(**params).asnumpy()
+        assert same(ret1, ret2), \
+                "ndarray test: `%s` should give the same result with the same seed"
+
+@with_seed()
+def test_randint_extremes():
+    a = mx.nd.random.randint(dtype='int64', low=50000000, high=50000010, ctx=mx.context.current_context())
+    assert a>=50000000 and a<=50000010
+
+@with_seed()
+def test_randint_generator():
+    ctx = mx.context.current_context()
+    for dtype in ['int32', 'int64']:
+        for low, high in [(50000000, 50001000),(-50000100,-50000000),(-500,199)]:
+            scale = high - low
+            buckets, probs = gen_buckets_probs_with_ppf(lambda x: ss.uniform.ppf(x, loc=low, scale=scale), 5)
+            # Quantize bucket boundaries to reflect the actual dtype and adjust probs accordingly
+            buckets = np.array(buckets, dtype=dtype).tolist()
+            probs = [(buckets[i][1] - buckets[i][0]) / float(scale) for i in range(5)]
+            generator_mx = lambda x: mx.nd.random.randint(low, high, shape=x, ctx=ctx, dtype=dtype).asnumpy()
+            verify_generator(generator=generator_mx, buckets=buckets, probs=probs, nrepeat=100)
+            # Scipy uses alpha = 0.01 for testing discrete distribution generator but we are using default alpha=0.05 (higher threshold ensures robustness)
+            # Refer - https://github.com/scipy/scipy/blob/9f12af697763fb5f9767d5cb1280ce62456a3974/scipy/stats/tests/test_discrete_basic.py#L45
+            generator_mx_same_seed = \
+                lambda x: np.concatenate(
+                    [mx.nd.random.randint(low, high, shape=x // 10, ctx=ctx, dtype=dtype).asnumpy()
+                        for _ in range(10)])
+            verify_generator(generator=generator_mx_same_seed, buckets=buckets, probs=probs, nrepeat=100)
+
+@with_seed()
+def test_randint_without_dtype():
+    a = mx.nd.random.randint(low=50000000, high=50000010, ctx=mx.context.current_context())
+    assert a.dtype == np.int32
+
+
+@with_seed()
+def test_sample_multinomial_num_outputs():
+    ctx = mx.context.current_context()
+    probs = [[0.125, 0.25, 0.25], [0.0625, 0.125, 0.1875]]
+    out = mx.nd.random.multinomial(data=mx.nd.array(probs, ctx=ctx), shape=10000, get_prob=False)
+    assert isinstance(out, mx.nd.NDArray)
+    out = mx.nd.random.multinomial(data=mx.nd.array(probs, ctx=ctx), shape=10000, get_prob=True)
+    assert isinstance(out, list)
+    assert len(out) == 2
+
 
 if __name__ == '__main__':
     import nose

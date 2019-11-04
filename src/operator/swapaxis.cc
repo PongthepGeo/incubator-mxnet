@@ -38,7 +38,7 @@ Operator* CreateOp<cpu>(SwapAxisParam param, int dtype) {
   return op;
 }
 
-Operator* SwapAxisProp::CreateOperatorEx(Context ctx, std::vector<TShape> *in_shape,
+Operator* SwapAxisProp::CreateOperatorEx(Context ctx, mxnet::ShapeVector *in_shape,
                                          std::vector<int> *in_type) const {
   DO_BIND_DISPATCH(CreateOp, param_, in_type->at(0));
 }
@@ -69,6 +69,6 @@ Examples::
                        [ 3, 7]]]
 )code" ADD_FILELINE);
 
-NNVM_REGISTER_OP(SwapAxis).add_alias("swapaxes");
+NNVM_REGISTER_OP(SwapAxis).add_alias("swapaxes").add_alias("_npi_swapaxes");
 }  // namespace op
 }  // namespace mxnet

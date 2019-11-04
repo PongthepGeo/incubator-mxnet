@@ -26,21 +26,32 @@
 
 #include "./spatial_transformer-inl.h"
 #include <algorithm>
-#if MXNET_USE_CUDNN == 1 && CUDNN_MAJOR >= 5
+#if MXNET_USE_CUDNN == 1
 #include "./cudnn_spatial_transformer-inl.h"
-#endif  // MXNET_USE_CUDNN && CUDNN_MAJOR
+#endif  // MXNET_USE_CUDNN
 
 namespace mshadow {
 template<typename DType>
 __device__ bool between(DType value, int lowerBound, int upperBound) {
   return (value >= lowerBound && value <= upperBound);
 }
+
 template<typename DType>
-__global__ void BilinearSamplingForwardKernel(const int i_c, const int i_h,
-                                              const int i_w, const DType* data,
-                                              const DType* grid, const int o_n,
-                                              const int o_c, const int o_h,
-                                              const int o_w, DType* out) {
+__global__ void
+/*
+ * In order to not generate the code that uses too many
+ * registers (resulting in too many resources requested
+ * error) we need to tell the compiler that we will be
+ * launching this kernel with cuda::kMaxThreadsPerBlock
+ * threads per block. Setting __launch_bounds__ ensures
+ * that such configuration can always be launched.
+ */
+__launch_bounds__(cuda::kMaxThreadsPerBlock, 1)
+BilinearSamplingForwardKernel(const int i_c, const int i_h,
+                              const int i_w, const DType* data,
+                              const DType* grid, const int o_n,
+                              const int o_c, const int o_h,
+                              const int o_w, DType* out) {
   for (int index = (blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x + threadIdx.x;
        index < o_n * o_c * o_h * o_w;
        index += blockDim.x * gridDim.x * gridDim.y) {
@@ -77,13 +88,23 @@ __global__ void BilinearSamplingForwardKernel(const int i_c, const int i_h,
     }
 }
 
+/*
+ * In order to not generate the code that uses too many
+ * registers (resulting in too many resources requested
+ * error) we need to tell the compiler that we will be
+ * launching this kernel with cuda::kMaxThreadsPerBlock
+ * threads per block. Setting __launch_bounds__ ensures
+ * that such configuration can always be launched.
+ */
 template<typename DType>
-__global__ void BilinearSamplingBackwardKernel(const int i_c, const int i_h,
-                                              const int i_w, const DType* grad,
-                                              const DType* data, const int o_n,
-                                              const int o_c, const int o_h,
-                                              const int o_w, DType* g_input,
-                                              DType* grid_src) {
+__global__ void
+__launch_bounds__(cuda::kMaxThreadsPerBlock, 1)
+BilinearSamplingBackwardKernel(const int i_c, const int i_h,
+                               const int i_w, const DType* grad,
+                               const DType* data, const int o_n,
+                               const int o_c, const int o_h,
+                               const int o_w, DType* g_input,
+                               DType* grid_src) {
   for (int index = (blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x + threadIdx.x;
        index < o_n * o_h * o_w;
        index += blockDim.x * gridDim.x * gridDim.y) {
@@ -193,7 +214,7 @@ namespace op {
 template<>
 Operator* CreateOp<gpu>(SpatialTransformerParam param, int dtype) {
   Operator *op = NULL;
-#if MXNET_USE_CUDNN == 1 && CUDNN_MAJOR >= 5
+#if MXNET_USE_CUDNN == 1
   MSHADOW_REAL_TYPE_SWITCH(dtype, DType, {
     if (param.cudnn_off.has_value() && param.cudnn_off.value()) {
       op = new SpatialTransformerOp<gpu, DType>(param);
@@ -205,7 +226,7 @@ Operator* CreateOp<gpu>(SpatialTransformerParam param, int dtype) {
   MSHADOW_REAL_TYPE_SWITCH(dtype, DType, {
     op = new SpatialTransformerOp<gpu, DType>(param);
   })
-#endif  // MXNET_USE_CUDNN && CUDNN_MAJOR
+#endif  // MXNET_USE_CUDNN
   return op;
 }
 

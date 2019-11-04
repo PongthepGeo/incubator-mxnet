@@ -38,6 +38,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
 from notebook_test import run_notebook
 
+# This is outdated and need to be completely redone.
 
 TUTORIAL_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'docs', '_build', 'html', 'tutorials')
 KERNEL = os.getenv('MXNET_TUTORIAL_TEST_KERNEL', None)
@@ -57,7 +58,6 @@ def _test_tutorial_nb(tutorial):
     """
     return run_notebook(tutorial, TUTORIAL_DIR, kernel=KERNEL, no_cache=NO_CACHE)
 
-
 def test_basic_ndarray():
    assert _test_tutorial_nb('basic/ndarray')
 
@@ -73,11 +73,17 @@ def test_basic_module():
 def test_basic_data():
     assert _test_tutorial_nb('basic/data')
 
+def test_basic_reshape_transpose():
+       assert _test_tutorial_nb('basic/reshape_transpose')
+
 def test_gluon_customop():
     assert _test_tutorial_nb('gluon/customop')
 
 def test_gluon_custom_layer():
     assert _test_tutorial_nb('gluon/custom_layer')
+
+def test_gluon_transforms():
+    assert _test_tutorial_nb('gluon/transforms')
 
 def test_gluon_data_augmentation():
     assert _test_tutorial_nb('gluon/data_augmentation')
@@ -100,12 +106,19 @@ def test_gluon_autograd():
 def test_gluon_gluon():
     assert _test_tutorial_nb('gluon/gluon')
 
-def test_gluon_save_load_model():
+def test_gluon_multi_gpu():
+    assert _test_tutorial_nb('gluon/multi_gpu')
+
+def test_gluon_save_load_params():
     assert _test_tutorial_nb('gluon/save_load_params')
 
 def test_gluon_hybrid():
     assert _test_tutorial_nb('gluon/hybrid')
-    
+# https://github.com/apache/incubator-mxnet/issues/16181
+"""
+def test_gluon_performance():
+    assert _test_tutorial_nb('gluon/performance')
+"""
 def test_gluon_pretrained_models():
     assert _test_tutorial_nb('gluon/pretrained_models')    
 
@@ -117,7 +130,13 @@ def test_gluon_learning_rate_schedules():
 
 def test_gluon_learning_rate_schedules_advanced():
     assert _test_tutorial_nb('gluon/learning_rate_schedules_advanced')
-  
+
+def test_gluon_info_gan():
+    assert _test_tutorial_nb('gluon/info_gan')
+
+def test_gluon_fit_api_fashion_mnist():
+    assert _test_tutorial_nb('gluon/fit_api_tutorial')
+
 def test_nlp_cnn():
     assert _test_tutorial_nb('nlp/cnn')
 
@@ -133,9 +152,6 @@ def test_onnx_fine_tuning_gluon():
 def test_onnx_inference_on_onnx_model():
     assert _test_tutorial_nb('onnx/inference_on_onnx_model')
 
-def test_python_matrix_factorization():
-    assert _test_tutorial_nb('python/matrix_factorization')
-
 def test_python_linear_regression():
     assert _test_tutorial_nb('python/linear-regression')
 
@@ -144,6 +160,9 @@ def test_python_logistic_regression() :
 
 def test_python_numpy_gotchas() :
     assert _test_tutorial_nb('gluon/gotchas_numpy_in_mxnet')
+
+def test_gluon_end_to_end():
+    assert _test_tutorial_nb('gluon/gluon_from_experiment_to_deployment')
 
 def test_python_mnist():
     assert _test_tutorial_nb('python/mnist')
@@ -160,12 +179,16 @@ def test_python_data_augmentation_with_masks():
 def test_python_kvstore():
     assert _test_tutorial_nb('python/kvstore')
 
+def test_module_to_gluon():
+    assert _test_tutorial_nb('python/module_to_gluon')
+
 def test_python_types_of_data_augmentation():
     assert _test_tutorial_nb('python/types_of_data_augmentation')
-
+#https://github.com/apache/incubator-mxnet/issues/16181
+"""
 def test_python_profiler():
     assert _test_tutorial_nb('python/profiler')
-
+"""
 def test_sparse_row_sparse():
     assert _test_tutorial_nb('sparse/row_sparse')
 
@@ -174,6 +197,9 @@ def test_sparse_csr():
 
 def test_sparse_train():
     assert _test_tutorial_nb('sparse/train')
+
+def test_sparse_train_gluon():
+    assert _test_tutorial_nb('sparse/train_gluon')
 
 def test_speech_recognition_ctc():
     assert _test_tutorial_nb('speech_recognition/ctc')
@@ -189,3 +215,11 @@ def test_vision_cnn_visualization():
 
 def test_control_flow():
     assert _test_tutorial_nb('control_flow/ControlFlowTutorial')
+
+def test_amp():
+    assert _test_tutorial_nb('amp/amp_tutorial')
+# https://github.com/apache/incubator-mxnet/issues/16181
+"""
+def test_mkldnn_quantization():
+    assert _test_tutorial_nb('mkldnn/mkldnn_quantization')
+"""

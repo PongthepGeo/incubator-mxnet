@@ -18,29 +18,45 @@
 import os
 import numpy as np
 import mxnet as mx
-from common import *
-from lenet5_common import get_iters
+from ctypes.util import find_library
 
+def check_tensorrt_installation():
+    assert find_library('nvinfer') is not None, "Can't find the TensorRT shared library"
+
+def get_iters(mnist, batch_size):
+    """Get MNIST iterators."""
+    train_iter = mx.io.NDArrayIter(mnist['train_data'],
+                                   mnist['train_label'],
+                                   batch_size,
+                                   shuffle=True)
+    val_iter = mx.io.NDArrayIter(mnist['test_data'], mnist['test_label'], batch_size)
+    test_iter = mx.io.NDArrayIter(mnist['test_data'], mnist['test_label'], batch_size)
+    all_test_labels = np.array(mnist['test_label'])
+    return train_iter, val_iter, test_iter, all_test_labels
 
 def run_inference(sym, arg_params, aux_params, mnist, all_test_labels, batch_size, use_tensorrt):
     """Run inference with either MXNet or TensorRT"""
-    mx.contrib.tensorrt.set_use_tensorrt(use_tensorrt)
 
     data_size = (batch_size,) + mnist['test_data'].shape[1:]
+    type_dict = {'data': 'float32', 'softmax_label': 'float32'}
+
     if use_tensorrt:
-        all_params = merge_dicts(arg_params, aux_params)
-        executor = mx.contrib.tensorrt.tensorrt_bind(sym, ctx=mx.gpu(0), all_params=all_params,
-                                                     data=data_size,
-                                                     softmax_label=(batch_size,),
-                                                     grad_req='null',
-                                                     force_rebind=True)
+        _sym = sym.get_backend_symbol('TensorRT')
+        arg_params, aux_params = mx.contrib.tensorrt.init_tensorrt_params(_sym, arg_params,
+                                                                          aux_params)
     else:
-        executor = sym.simple_bind(ctx=mx.gpu(0),
-                                   data=data_size,
-                                   softmax_label=(batch_size,),
-                                   grad_req='null',
-                                   force_rebind=True)
-        executor.copy_params_from(arg_params, aux_params)
+        _sym = sym
+    for k, v in arg_params.items():
+        type_dict[k] = v.dtype
+    for k, v in aux_params.items():
+        type_dict[k] = v.dtype
+    executor = _sym.simple_bind(ctx=mx.gpu(0),
+                                type_dict=type_dict,
+                                data=data_size,
+                                softmax_label=(batch_size,),
+                                grad_req='null',
+                                force_rebind=True)
+    executor.copy_params_from(arg_params, aux_params)
 
     # Get this value from all_test_labels
     # Also get classes from the dataset
@@ -68,40 +84,37 @@ def run_inference(sym, arg_params, aux_params, mnist, all_test_labels, batch_siz
 
 def test_tensorrt_inference():
     """Run LeNet-5 inference comparison between MXNet and TensorRT."""
-    original_try_value = mx.contrib.tensorrt.get_use_tensorrt()
-    try:
-        check_tensorrt_installation()
-        mnist = mx.test_utils.get_mnist()
-        num_epochs = 10
-        batch_size = 128
-        model_name = 'lenet5'
-        model_dir = os.getenv("LENET_MODEL_DIR", "/tmp")
-        model_file = '%s/%s-symbol.json' % (model_dir, model_name)
-        params_file = '%s/%s-%04d.params' % (model_dir, model_name, num_epochs)
+    check_tensorrt_installation()
+    mnist = mx.test_utils.get_mnist()
+    num_epochs = 10
+    batch_size = 128
+    model_name = 'lenet5'
+    model_dir = os.getenv("LENET_MODEL_DIR", "/tmp")
+    model_file = '%s/%s-symbol.json' % (model_dir, model_name)
+    params_file = '%s/%s-%04d.params' % (model_dir, model_name, num_epochs)
 
-        _, _, _, all_test_labels = get_iters(mnist, batch_size)
+    _, _, _, all_test_labels = get_iters(mnist, batch_size)
 
-        # Load serialized MXNet model (model-symbol.json + model-epoch.params)
-        sym, arg_params, aux_params = mx.model.load_checkpoint(model_name, num_epochs)
+    # Load serialized MXNet model (model-symbol.json + model-epoch.params)
+    sym, arg_params, aux_params = mx.model.load_checkpoint(model_name, num_epochs)
 
-        print("LeNet-5 test")
-        print("Running inference in MXNet")
-        mx_pct = run_inference(sym, arg_params, aux_params, mnist, all_test_labels,
-                               batch_size=batch_size, use_tensorrt=False)
+    print("LeNet-5 test")
+    print("Running inference in MXNet")
+    mx_pct = run_inference(sym, arg_params, aux_params, mnist, all_test_labels,
+                           batch_size=batch_size, use_tensorrt=False)
 
-        print("Running inference in MXNet-TensorRT")
-        trt_pct = run_inference(sym, arg_params, aux_params, mnist, all_test_labels,
-                                batch_size=batch_size, use_tensorrt=True)
+    print("Running inference in MXNet-TensorRT")
+    trt_pct = run_inference(sym, arg_params, aux_params, mnist, all_test_labels,
+                            batch_size=batch_size, use_tensorrt=True)
 
-        print("MXNet accuracy: %f" % mx_pct)
-        print("MXNet-TensorRT accuracy: %f" % trt_pct)
+    print("MXNet accuracy: %f" % mx_pct)
+    print("MXNet-TensorRT accuracy: %f" % trt_pct)
 
-        assert abs(mx_pct - trt_pct) < 1e-2, \
-            """Diff. between MXNet & TensorRT accuracy too high:
-               MXNet = %f, TensorRT = %f""" % (mx_pct, trt_pct)
-    finally:
-        mx.contrib.tensorrt.set_use_tensorrt(original_try_value)
-
+    absolute_accuracy_diff = abs(mx_pct - trt_pct)
+    epsilon = 3e-2
+    assert absolute_accuracy_diff < epsilon, \
+        """Absolute diff. between MXNet & TensorRT accuracy (%f) exceeds threshold (%f):
+           MXNet = %f, TensorRT = %f""" % (absolute_accuracy_diff, epsilon, mx_pct, trt_pct)
 
 if __name__ == '__main__':
     import nose

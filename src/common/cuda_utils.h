@@ -20,7 +20,7 @@
 /*!
  * Copyright (c) 2015 by Contributors
  * \file cuda_utils.h
- * \brief CUDA debugging utilities.
+ * \brief Common CUDA utilities.
  */
 #ifndef MXNET_COMMON_CUDA_UTILS_H_
 #define MXNET_COMMON_CUDA_UTILS_H_
@@ -29,6 +29,7 @@
 #include <dmlc/parameter.h>
 #include <dmlc/optional.h>
 #include <mshadow/base.h>
+#include <mxnet/libinfo.h>
 
 /*! \brief Macros/inlines to assist CLion to parse Cuda files (*.cu, *.cuh) */
 #ifdef __JETBRAINS_IDE__
@@ -47,11 +48,21 @@ extern __cuda_fake_struct threadIdx;
 extern __cuda_fake_struct blockIdx;
 #endif
 
+#define QUOTE(x) #x
+#define QUOTEVALUE(x) QUOTE(x)
+
 #if MXNET_USE_CUDA
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <curand.h>
+
+#include <vector>
+
+#define STATIC_ASSERT_CUDA_VERSION_GE(min_version) \
+  static_assert(CUDA_VERSION >= min_version, "Compiled-against CUDA version " \
+      QUOTEVALUE(CUDA_VERSION) " is too old, please upgrade system to version " \
+      QUOTEVALUE(min_version) " or later.")
 
 /*!
  * \brief When compiling a __device__ function, check that the architecture is >= Kepler (3.0)
@@ -67,6 +78,110 @@ inline __device__ bool __is_supported_cuda_architecture() {
 #endif  // __CUDA_ARCH__ < 300
 }
 #endif  // __CUDACC__
+
+/*!
+ * \brief Check CUDA error.
+ * \param msg Message to print if an error occured.
+ */
+#define CHECK_CUDA_ERROR(msg)                                                \
+  {                                                                          \
+    cudaError_t e = cudaGetLastError();                                      \
+    CHECK_EQ(e, cudaSuccess) << (msg) << " CUDA: " << cudaGetErrorString(e); \
+  }
+
+/*!
+ * \brief Protected CUDA call.
+ * \param func Expression to call.
+ *
+ * It checks for CUDA errors after invocation of the expression.
+ */
+#define CUDA_CALL(func)                                            \
+  {                                                                \
+    cudaError_t e = (func);                                        \
+    CHECK(e == cudaSuccess || e == cudaErrorCudartUnloading)       \
+        << "CUDA: " << cudaGetErrorString(e);                      \
+  }
+
+/*!
+ * \brief Protected cuBLAS call.
+ * \param func Expression to call.
+ *
+ * It checks for cuBLAS errors after invocation of the expression.
+ */
+#define CUBLAS_CALL(func)                                       \
+  {                                                             \
+    cublasStatus_t e = (func);                                  \
+    CHECK_EQ(e, CUBLAS_STATUS_SUCCESS)                          \
+        << "cuBLAS: " << mxnet::common::cuda::CublasGetErrorString(e); \
+  }
+
+/*!
+ * \brief Protected cuSolver call.
+ * \param func Expression to call.
+ *
+ * It checks for cuSolver errors after invocation of the expression.
+ */
+#define CUSOLVER_CALL(func)                                         \
+  {                                                                 \
+    cusolverStatus_t e = (func);                                    \
+    CHECK_EQ(e, CUSOLVER_STATUS_SUCCESS)                            \
+        << "cuSolver: " << mxnet::common::cuda::CusolverGetErrorString(e); \
+  }
+
+/*!
+ * \brief Protected cuRAND call.
+ * \param func Expression to call.
+ *
+ * It checks for cuRAND errors after invocation of the expression.
+ */
+#define CURAND_CALL(func)                                       \
+  {                                                             \
+    curandStatus_t e = (func);                                  \
+    CHECK_EQ(e, CURAND_STATUS_SUCCESS)                          \
+        << "cuRAND: " << mxnet::common::cuda::CurandGetErrorString(e); \
+  }
+
+/*!
+ * \brief Protected NVRTC call.
+ * \param func Expression to call.
+ *
+ * It checks for NVRTC errors after invocation of the expression.
+ */
+#define NVRTC_CALL(x)                                   \
+  {                                                     \
+    nvrtcResult result = x;                             \
+    CHECK_EQ(result, NVRTC_SUCCESS)                     \
+      << #x " failed with error "                       \
+      << nvrtcGetErrorString(result);                   \
+  }
+
+/*!
+ * \brief Protected CUDA driver call.
+ * \param func Expression to call.
+ *
+ * It checks for CUDA driver errors after invocation of the expression.
+ */
+#define CUDA_DRIVER_CALL(func)                                          \
+  {                                                                     \
+    CUresult e = (func);                                                \
+    if (e != CUDA_SUCCESS) {                                            \
+      char const * err_msg = nullptr;                                         \
+      if (cuGetErrorString(e, &err_msg) == CUDA_ERROR_INVALID_VALUE) {  \
+        LOG(FATAL) << "CUDA Driver: Unknown error " << e;               \
+      } else {                                                          \
+        LOG(FATAL) << "CUDA Driver: " << err_msg;                       \
+      }                                                                 \
+    }                                                                   \
+  }
+
+
+#if !defined(_MSC_VER)
+#define CUDA_UNROLL _Pragma("unroll")
+#define CUDA_NOUNROLL _Pragma("nounroll")
+#else
+#define CUDA_UNROLL
+#define CUDA_NOUNROLL
+#endif
 
 namespace mxnet {
 namespace common {
@@ -179,113 +294,92 @@ inline DType __device__ CudaMin(DType a, DType b) {
     return a < b ? a : b;
 }
 
+class DeviceStore {
+ public:
+  /*! \brief default constructor- only optionally restores previous device */
+  explicit DeviceStore(int requested_device = -1, bool restore = true) :
+    restore_device_(-1),
+    current_device_(requested_device),
+    restore_(restore) {
+    if (restore_)
+      CUDA_CALL(cudaGetDevice(&restore_device_));
+    if (requested_device != restore_device_) {
+      SetDevice(requested_device);
+    }
+  }
+
+  ~DeviceStore() {
+    if (restore_ &&
+        current_device_ != restore_device_ &&
+        current_device_ != -1 &&
+        restore_device_ != -1)
+      CUDA_CALL(cudaSetDevice(restore_device_));
+  }
+
+  void SetDevice(int device) {
+    if (device != -1) {
+      CUDA_CALL(cudaSetDevice(device));
+      current_device_ = device;
+    }
+  }
+
+ private:
+  int restore_device_;
+  int current_device_;
+  bool restore_;
+};
+
+/*!
+ * \brief Get the largest datatype suitable to read
+ *         requested number of bytes.
+ *
+ *  \input Number of bytes to be read
+ *  \return mshadow representation of type that could
+ *          be used for reading
+ */
+int get_load_type(size_t N);
+
+/*!
+ * \brief Determine how many rows in a 2D matrix should a block
+ *        of threads handle based on the row size and the number
+ *        of threads in a block.
+ * \param row_size Size of the row expressed in the number of reads required to fully
+ *                 load it. For example, if the row has N elements, but  each thread
+ *                 reads 2 elements with a single read, row_size should be N / 2.
+ * \param num_threads_per_block Number of threads in a block.
+ * \return the number of rows that should be handled by a single block.
+ */
+int get_rows_per_block(size_t row_size, int num_threads_per_block);
+
 }  // namespace cuda
 }  // namespace common
 }  // namespace mxnet
 
-/*!
- * \brief Check CUDA error.
- * \param msg Message to print if an error occured.
- */
-#define CHECK_CUDA_ERROR(msg)                                                \
-  {                                                                          \
-    cudaError_t e = cudaGetLastError();                                      \
-    CHECK_EQ(e, cudaSuccess) << (msg) << " CUDA: " << cudaGetErrorString(e); \
-  }
+/*! \brief Maximum number of GPUs */
+constexpr size_t kMaxNumGpus = 64;
+
+// The implementations below assume that accesses of 32-bit ints are inherently atomic and
+// can be read/written by multiple threads without locks.  The values held should be < 2^31.
 
 /*!
- * \brief Protected CUDA call.
- * \param func Expression to call.
- *
- * It checks for CUDA errors after invocation of the expression.
+ * \brief Return an attribute GPU `device_id`.
+ * \param device_id The device index of the cuda-capable gpu of interest.
+ * \param cached_values An array of attributes for already-looked-up GPUs.
+ * \param attr The attribute, by number.
+ * \param attr_name A string representation of the attribute, for error messages.
+ * \return the gpu's attribute value.
  */
-#define CUDA_CALL(func)                                            \
-  {                                                                \
-    cudaError_t e = (func);                                        \
-    CHECK(e == cudaSuccess || e == cudaErrorCudartUnloading)       \
-        << "CUDA: " << cudaGetErrorString(e);                      \
+inline int cudaAttributeLookup(int device_id, std::vector<int32_t> *cached_values,
+                               cudaDeviceAttr attr, const char *attr_name) {
+  if (device_id < 0 || device_id >= static_cast<int>(cached_values->size())) {
+    LOG(FATAL) << attr_name << "(device_id) called with invalid id: " << device_id;
+  } else if ((*cached_values)[device_id] < 0) {
+    int temp = -1;
+    CUDA_CALL(cudaDeviceGetAttribute(&temp, attr, device_id));
+    (*cached_values)[device_id] = static_cast<int32_t>(temp);
   }
-
-/*!
- * \brief Protected cuBLAS call.
- * \param func Expression to call.
- *
- * It checks for cuBLAS errors after invocation of the expression.
- */
-#define CUBLAS_CALL(func)                                       \
-  {                                                             \
-    cublasStatus_t e = (func);                                  \
-    CHECK_EQ(e, CUBLAS_STATUS_SUCCESS)                          \
-        << "cuBLAS: " << mxnet::common::cuda::CublasGetErrorString(e); \
-  }
-
-/*!
- * \brief Protected cuSolver call.
- * \param func Expression to call.
- *
- * It checks for cuSolver errors after invocation of the expression.
- */
-#define CUSOLVER_CALL(func)                                         \
-  {                                                                 \
-    cusolverStatus_t e = (func);                                    \
-    CHECK_EQ(e, CUSOLVER_STATUS_SUCCESS)                            \
-        << "cuSolver: " << mxnet::common::cuda::CusolverGetErrorString(e); \
-  }
-
-/*!
- * \brief Protected cuRAND call.
- * \param func Expression to call.
- *
- * It checks for cuRAND errors after invocation of the expression.
- */
-#define CURAND_CALL(func)                                       \
-  {                                                             \
-    curandStatus_t e = (func);                                  \
-    CHECK_EQ(e, CURAND_STATUS_SUCCESS)                          \
-        << "cuRAND: " << mxnet::common::cuda::CurandGetErrorString(e); \
-  }
-
-/*!
- * \brief Protected NVRTC call.
- * \param func Expression to call.
- *
- * It checks for NVRTC errors after invocation of the expression.
- */
-#define NVRTC_CALL(x)                                   \
-  {                                                     \
-    nvrtcResult result = x;                             \
-    CHECK_EQ(result, NVRTC_SUCCESS)                     \
-      << #x " failed with error "                       \
-      << nvrtcGetErrorString(result);                   \
-  }
-
-/*!
- * \brief Protected CUDA driver call.
- * \param func Expression to call.
- *
- * It checks for CUDA driver errors after invocation of the expression.
- */
-#define CUDA_DRIVER_CALL(func)                                          \
-  {                                                                     \
-    CUresult e = (func);                                                \
-    if (e != CUDA_SUCCESS) {                                            \
-      char const * err_msg = nullptr;                                         \
-      if (cuGetErrorString(e, &err_msg) == CUDA_ERROR_INVALID_VALUE) {  \
-        LOG(FATAL) << "CUDA Driver: Unknown error " << e;               \
-      } else {                                                          \
-        LOG(FATAL) << "CUDA Driver: " << err_msg;                       \
-      }                                                                 \
-    }                                                                   \
-  }
-
-
-#if !defined(_MSC_VER)
-#define CUDA_UNROLL _Pragma("unroll")
-#define CUDA_NOUNROLL _Pragma("nounroll")
-#else
-#define CUDA_UNROLL
-#define CUDA_NOUNROLL
-#endif
+  return (*cached_values)[device_id];
+}
 
 /*!
  * \brief Determine major version number of the gpu's cuda compute architecture.
@@ -293,10 +387,9 @@ inline DType __device__ CudaMin(DType a, DType b) {
  * \return the major version number of the gpu's cuda compute architecture.
  */
 inline int ComputeCapabilityMajor(int device_id) {
-  int major = 0;
-  CUDA_CALL(cudaDeviceGetAttribute(&major,
-                                   cudaDevAttrComputeCapabilityMajor, device_id));
-  return major;
+  static std::vector<int32_t> capability_major(kMaxNumGpus, -1);
+  return cudaAttributeLookup(device_id, &capability_major,
+                             cudaDevAttrComputeCapabilityMajor, "ComputeCapabilityMajor");
 }
 
 /*!
@@ -305,10 +398,9 @@ inline int ComputeCapabilityMajor(int device_id) {
  * \return the minor version number of the gpu's cuda compute architecture.
  */
 inline int ComputeCapabilityMinor(int device_id) {
-  int minor = 0;
-  CUDA_CALL(cudaDeviceGetAttribute(&minor,
-                                   cudaDevAttrComputeCapabilityMinor, device_id));
-  return minor;
+  static std::vector<int32_t> capability_minor(kMaxNumGpus, -1);
+  return cudaAttributeLookup(device_id, &capability_minor,
+                             cudaDevAttrComputeCapabilityMinor, "ComputeCapabilityMinor");
 }
 
 /*!
@@ -320,6 +412,40 @@ inline int SMArch(int device_id) {
   auto major = ComputeCapabilityMajor(device_id);
   auto minor = ComputeCapabilityMinor(device_id);
   return 10 * major + minor;
+}
+
+/*!
+ * \brief Return the number of streaming multiprocessors of GPU `device_id`.
+ * \param device_id The device index of the cuda-capable gpu of interest.
+ * \return the gpu's count of streaming multiprocessors.
+ */
+inline int MultiprocessorCount(int device_id) {
+  static std::vector<int32_t> sm_counts(kMaxNumGpus, -1);
+  return cudaAttributeLookup(device_id, &sm_counts,
+                             cudaDevAttrMultiProcessorCount, "MultiprocessorCount");
+}
+
+/*!
+ * \brief Return the shared memory size in bytes of each of the GPU's streaming multiprocessors.
+ * \param device_id The device index of the cuda-capable gpu of interest.
+ * \return the shared memory size per streaming multiprocessor.
+ */
+inline int MaxSharedMemoryPerMultiprocessor(int device_id) {
+  static std::vector<int32_t> max_smem_per_mutiprocessor(kMaxNumGpus, -1);
+  return cudaAttributeLookup(device_id, &max_smem_per_mutiprocessor,
+                             cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                             "MaxSharedMemoryPerMultiprocessor");
+}
+
+/*!
+ * \brief Return whether the GPU `device_id` supports cooperative-group kernel launching.
+ * \param device_id The device index of the cuda-capable gpu of interest.
+ * \return the gpu's ability to run cooperative-group kernels.
+ */
+inline bool SupportsCooperativeLaunch(int device_id) {
+  static std::vector<int32_t> coop_launch(kMaxNumGpus, -1);
+  return cudaAttributeLookup(device_id, &coop_launch,
+                             cudaDevAttrCooperativeLaunch, "SupportsCooperativeLaunch");
 }
 
 /*!
@@ -374,6 +500,22 @@ inline bool GetEnvAllowTensorCore() {
   return allow_tensor_core;
 }
 
+// The policy if the user hasn't set the environment variable
+// CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION
+#define MXNET_CUDA_TENSOR_OP_MATH_ALLOW_CONVERSION_DEFAULT false
+
+/*!
+ * \brief Returns global policy for TensorCore implicit type casting
+ */
+inline bool GetEnvAllowTensorCoreConversion() {
+  // Use of optional<bool> here permits: "0", "1", "true" and "false" to all be
+  // legal.
+  bool default_value = MXNET_CUDA_TENSOR_OP_MATH_ALLOW_CONVERSION_DEFAULT;
+  return dmlc::GetEnv("MXNET_CUDA_TENSOR_OP_MATH_ALLOW_CONVERSION",
+                      dmlc::optional<bool>(default_value))
+      .value();
+}
+
 #if CUDA_VERSION >= 9000
 // Sets the cuBLAS math mode that determines the 'allow TensorCore' policy.  Returns previous.
 inline cublasMath_t SetCublasMathMode(cublasHandle_t blas_handle, cublasMath_t new_math_type) {
@@ -390,6 +532,25 @@ inline cublasMath_t SetCublasMathMode(cublasHandle_t blas_handle, cublasMath_t n
 
 #include <cudnn.h>
 
+// Creating CUDNN_VERSION_AS_STRING as follows avoids a static_assert error message that shows
+// the formula for CUDNN_VERSION, i.e. "1000 * 7 + 100 * 6 + 0" rather than number "7600".
+static_assert(CUDNN_PATCHLEVEL < 100 && CUDNN_MINOR < 10,
+              "CUDNN_VERSION_AS_STRING macro assumptions violated.");
+#if CUDNN_PATCHLEVEL >= 10
+#define CUDNN_VERSION_AS_STRING QUOTEVALUE(CUDNN_MAJOR) \
+                                QUOTEVALUE(CUDNN_MINOR) \
+                                QUOTEVALUE(CUDNN_PATCHLEVEL)
+#else
+#define CUDNN_VERSION_AS_STRING QUOTEVALUE(CUDNN_MAJOR) \
+                                QUOTEVALUE(CUDNN_MINOR) \
+                                "0" QUOTEVALUE(CUDNN_PATCHLEVEL)
+#endif
+
+#define STATIC_ASSERT_CUDNN_VERSION_GE(min_version) \
+  static_assert(CUDNN_VERSION >= min_version, "Compiled-against cuDNN version " \
+      CUDNN_VERSION_AS_STRING " is too old, please upgrade system to version " \
+      QUOTEVALUE(min_version) " or later.")
+
 #define CUDNN_CALL(func)                                                      \
   {                                                                           \
     cudnnStatus_t e = (func);                                                 \
@@ -404,13 +565,10 @@ inline cublasMath_t SetCublasMathMode(cublasHandle_t blas_handle, cublasMath_t n
  *         want to populate.
  */
 inline int MaxForwardAlgos(cudnnHandle_t cudnn_handle) {
-#if CUDNN_MAJOR >= 7
+  STATIC_ASSERT_CUDNN_VERSION_GE(7000);
   int max_algos = 0;
   CUDNN_CALL(cudnnGetConvolutionForwardAlgorithmMaxCount(cudnn_handle, &max_algos));
   return max_algos;
-#else
-  return 10;
-#endif
 }
 
 /*!
@@ -421,13 +579,10 @@ inline int MaxForwardAlgos(cudnnHandle_t cudnn_handle) {
  *         want to populate.
  */
 inline int MaxBackwardFilterAlgos(cudnnHandle_t cudnn_handle) {
-#if CUDNN_MAJOR >= 7
+  STATIC_ASSERT_CUDNN_VERSION_GE(7000);
   int max_algos = 0;
   CUDNN_CALL(cudnnGetConvolutionBackwardFilterAlgorithmMaxCount(cudnn_handle, &max_algos));
   return max_algos;
-#else
-  return 10;
-#endif
 }
 
 /*!
@@ -438,13 +593,10 @@ inline int MaxBackwardFilterAlgos(cudnnHandle_t cudnn_handle) {
  *         want to populate.
  */
 inline int MaxBackwardDataAlgos(cudnnHandle_t cudnn_handle) {
-#if CUDNN_MAJOR >= 7
+  STATIC_ASSERT_CUDNN_VERSION_GE(7000);
   int max_algos = 0;
   CUDNN_CALL(cudnnGetConvolutionBackwardDataAlgorithmMaxCount(cudnn_handle, &max_algos));
   return max_algos;
-#else
-  return 10;
-#endif
 }
 
 #endif  // MXNET_USE_CUDNN
@@ -472,7 +624,7 @@ static inline  __device__  void atomicAdd(double *address, double val) {
 // Overload atomicAdd for half precision
 // Taken from:
 // https://github.com/torch/cutorch/blob/master/lib/THC/THCAtomics.cuh
-#if defined(__CUDA_ARCH__)
+#ifdef __CUDACC__
 static inline __device__ void atomicAdd(mshadow::half::half_t *address,
                                         mshadow::half::half_t val) {
   unsigned int *address_as_ui =
@@ -537,6 +689,28 @@ __device__ inline DType ldg(const DType* address) {
     return *address;
 #endif
 }
-#endif
+
+template <typename OP, typename T>
+__device__ inline T warp_reduce(T value, OP redfun) {
+  value = redfun(value, __shfl_down_sync(0xffffffff, value, 16));
+  value = redfun(value, __shfl_down_sync(0xffffffff, value, 8));
+  value = redfun(value, __shfl_down_sync(0xffffffff, value, 4));
+  value = redfun(value, __shfl_down_sync(0xffffffff, value, 2));
+  value = redfun(value, __shfl_down_sync(0xffffffff, value, 1));
+  return value;
+}
+
+template <typename OP>
+__device__ inline mshadow::half::half_t warp_reduce(mshadow::half::half_t value, OP redfun) {
+  float v = static_cast<float>(value);
+  v = redfun(v, __shfl_down_sync(0xffffffff, v, 16));
+  v = redfun(v, __shfl_down_sync(0xffffffff, v, 8));
+  v = redfun(v, __shfl_down_sync(0xffffffff, v, 4));
+  v = redfun(v, __shfl_down_sync(0xffffffff, v, 2));
+  v = redfun(v, __shfl_down_sync(0xffffffff, v, 1));
+  return mshadow::half::half_t(v);
+}
+
+#endif  // __CUDACC__
 
 #endif  // MXNET_COMMON_CUDA_UTILS_H_

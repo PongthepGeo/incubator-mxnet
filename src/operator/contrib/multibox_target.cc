@@ -81,7 +81,7 @@ inline void MultiBoxTargetForward(const Tensor<cpu, 2, DType> &loc_target,
                            const float negative_mining_ratio,
                            const float negative_mining_thresh,
                            const int minimum_negative_samples,
-                           const nnvm::Tuple<float> &variances) {
+                           const mxnet::Tuple<float> &variances) {
   const DType *p_anchor = anchors.dptr_;
   const int num_batches = labels.size(0);
   const int num_labels = labels.size(1);
@@ -291,9 +291,9 @@ Operator *CreateOp<cpu>(MultiBoxTargetParam param, int dtype) {
   return op;
 }
 
-Operator* MultiBoxTargetProp::CreateOperatorEx(Context ctx, std::vector<TShape> *in_shape,
+Operator* MultiBoxTargetProp::CreateOperatorEx(Context ctx, mxnet::ShapeVector *in_shape,
                                        std::vector<int> *in_type) const {
-  std::vector<TShape> out_shape, aux_shape;
+  mxnet::ShapeVector out_shape, aux_shape;
   std::vector<int> out_type, aux_type;
   CHECK(InferShape(in_shape, &out_shape, &aux_shape));
   CHECK(InferType(in_type, &out_type, &aux_type));
@@ -307,5 +307,9 @@ MXNET_REGISTER_OP_PROPERTY(_contrib_MultiBoxTarget, MultiBoxTargetProp)
 .add_argument("label", "NDArray-or-Symbol", "Object detection labels.")
 .add_argument("cls_pred", "NDArray-or-Symbol", "Class predictions.")
 .add_arguments(MultiBoxTargetParam::__FIELDS__());
+
+NNVM_REGISTER_OP(_contrib_MultiBoxTarget)
+.add_alias("_npx_multibox_target");
+
 }  // namespace op
 }  // namespace mxnet

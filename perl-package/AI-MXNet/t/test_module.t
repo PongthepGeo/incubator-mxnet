@@ -17,11 +17,12 @@
 
 use strict;
 use warnings;
-use Test::More tests => 426;
+use Test::More tests => 428;
 use AI::MXNet qw(mx);
 use AI::MXNet::Base;
 use AI::MXNet::TestUtils qw(almost_equal enumerate same_array dies_like rand_ndarray);
 $ENV{MXNET_STORAGE_FALLBACK_LOG_VERBOSE} = 0;
+$ENV{MXNET_SUBGRAPH_VERBOSE} = 0;
 
 sub test_module_layout
 {
@@ -789,6 +790,17 @@ sub test_forward_reshape
 
 }
 
+sub test_forward_acceptable_input
+{
+    my $data = mx->sym->Variable('data');
+    my $out = $data * 2;
+    my $mod = mx->mod->Module(symbol => $out);
+    $mod->bind(data_shapes => [['data', [1, 10]]]);
+    $mod->init_params();
+    is_deeply($mod->predict(mx->nd->ones([1, 10]))->shape, [1, 10]);
+    is_deeply($mod->predict(mx->nd->ones([1, 10])->aspdl)->shape, [1, 10]);
+}
+
 test_module_input_grads();
 test_module_dtype();
 test_monitor();
@@ -802,3 +814,4 @@ test_module_set_params();
 test_forward_reshape();
 test_module_initializer();
 test_factorization_machine_module();
+test_forward_acceptable_input();

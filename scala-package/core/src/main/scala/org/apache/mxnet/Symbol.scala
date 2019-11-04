@@ -21,7 +21,9 @@ import org.apache.mxnet.Base._
 import org.apache.mxnet.DType.DType
 import org.slf4j.{Logger, LoggerFactory}
 
+import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import scala.language.implicitConversions
 
 /**
  * Symbolic configuration API of mxnet. <br />
@@ -29,21 +31,15 @@ import scala.collection.mutable.{ArrayBuffer, ListBuffer}
  * WARNING: it is your responsibility to clear this object through dispose().
  * </b>
  */
-class Symbol private(private[mxnet] val handle: SymbolHandle) extends WarnIfNotDisposed {
+class Symbol private(private[mxnet] val handle: SymbolHandle) extends NativeResource {
   private val logger: Logger = LoggerFactory.getLogger(classOf[Symbol])
-  private var disposed = false
-  protected def isDisposed = disposed
 
-  /**
-   * Release the native memory.
-   * The object shall never be used after it is disposed.
-   */
-  def dispose(): Unit = {
-    if (!disposed) {
-      _LIB.mxSymbolFree(handle)
-      disposed = true
-    }
-  }
+  // unable to get the byteAllocated for Symbol
+  override val bytesAllocated: Long = 0L
+  override def nativeAddress: CPtrAddress = handle
+  override def nativeDeAllocator: (CPtrAddress => Int) = _LIB.mxSymbolFree
+  override val ref: NativeResourceRef = super.register()
+
 
   def +(other: Symbol): Symbol = Symbol.createFromListedSymbols("_Plus")(Array(this, other))
   def +[@specialized(Int, Float, Double) V](other: V): Symbol = {
@@ -215,6 +211,33 @@ class Symbol private(private[mxnet] val handle: SymbolHandle) extends WarnIfNotD
   }
 
   /**
+    * Infer the shape of outputs and arguments of given known shapes of arguments.
+    * User can either pass in the known shapes in positional way or keyword argument way.
+    * Tuple of Nones is returned if there is not enough information passed in.
+    * An error will be raised if there is inconsistency found in the known shapes passed in.
+    * @param args Provide a list of DataDesc containing the shapes to resolve
+    * @return
+    * argShapes List of shapes of arguments. The order is in the same order as list_arguments()
+    * outShapes List of shapes of outputs. The order is in the same order as list_outputs()
+    * auxShapes List of shapes of outputs. The order is in the same order as list_auxiliary()
+    */
+  def inferShape(args: IndexedSeq[DataDesc]):
+  (IndexedSeq[Shape], IndexedSeq[Shape], IndexedSeq[Shape]) = {
+    val keys = ArrayBuffer.empty[String]
+    val indPtr = ArrayBuffer(0)
+    val sdata = ArrayBuffer.empty[Int]
+    args.foreach { arg =>
+      val shape = arg.shape
+      if (shape != null) {
+        keys += arg.name
+        sdata ++= shape.toVector
+        indPtr += sdata.size
+      }
+    }
+    inferShape(keys.toArray, indPtr.toArray, sdata.toArray)
+  }
+
+  /**
    * Infer the shape of outputs and arguments of given known shapes of arguments.
    * User can either pass in the known shapes in positional way or keyword argument way.
    * Tuple of Nones is returned if there is not enough information passed in.
@@ -265,17 +288,45 @@ class Symbol private(private[mxnet] val handle: SymbolHandle) extends WarnIfNotD
 
   def inferShape(keys: Array[String], indPtr: Array[Int], values: Array[Int])
     : (IndexedSeq[Shape], IndexedSeq[Shape], IndexedSeq[Shape]) = {
+    val res = inferShapeImpl(partial = false, keys, indPtr, values)
+    if (res._2 == null) {
+      val (argShapes, _, _) = inferShapeImpl(partial = true, keys, indPtr, values)
+      val argNames = listArguments()
+      val unknown = (argNames zip argShapes).map { case (name, shape) =>
+        val shapeIsNone = if (NumpyScope.isNumpyShape) {
+          shape == null || shape.toVector.contains(-1)
+        } else {
+          shape == null || shape.toVector.contains(0)
+        }
+        if (shapeIsNone) s"$name: $shape" else ""
+      }
+      logger.warn("Cannot decide shape for the following arguments. " +
+        "Consider providing them as input: \n\t{}",
+        unknown.filter(_ != "").mkString("\n\t"))
+    }
+    res
+  }
+
+  private def inferShapeImpl(partial: Boolean,
+                             keys: Array[String],
+                             indPtr: Array[Int],
+                             values: Array[Int])
+    : (IndexedSeq[Shape], IndexedSeq[Shape], IndexedSeq[Shape]) = {
     val argShapeData = ListBuffer.empty[Array[Int]]
     val outShapeData = ListBuffer.empty[Array[Int]]
     val auxShapeData = ListBuffer.empty[Array[Int]]
     val complete = new RefInt
-
-    checkCall(_LIB.mxSymbolInferShape(handle, indPtr.length - 1, keys, indPtr, values,
-      argShapeData, outShapeData, auxShapeData, complete))
+    if (partial) {
+      checkCall(_LIB.mxSymbolInferShapePartial(handle, indPtr.length - 1, keys, indPtr, values,
+        argShapeData, outShapeData, auxShapeData, complete))
+    } else {
+      checkCall(_LIB.mxSymbolInferShape(handle, indPtr.length - 1, keys, indPtr, values,
+        argShapeData, outShapeData, auxShapeData, complete))
+    }
     if (complete.value != 0) {
       (argShapeData.map(s => Shape(s)).toIndexedSeq,
-       outShapeData.map(s => Shape(s)).toIndexedSeq,
-       auxShapeData.map(s => Shape(s)).toIndexedSeq)
+        outShapeData.map(s => Shape(s)).toIndexedSeq,
+        auxShapeData.map(s => Shape(s)).toIndexedSeq)
     } else {
       (null, null, null)
     }
@@ -392,6 +443,29 @@ class Symbol private(private[mxnet] val handle: SymbolHandle) extends WarnIfNotD
     val keys = symbols.keys.toArray
     val args = symbols.values.map(_.handle).toArray
     checkCall(_LIB.mxSymbolCompose(handle, name, keys, args))
+  }
+
+  /**
+    * Bind current symbol to get an executor, allocate all the ndarrays needed.
+    * Allows specifying data types.
+    * This function will ask user to pass in ndarray of position
+    * they like to bind to, and it will automatically allocate the ndarray
+    * for arguments and auxiliary states that user did not specify explicitly.
+    *
+    * @param ctx The device context the generated executor to run on.
+    * @param gradReq {'write', 'add', 'null'}, or list of str or dict of str to str, optional
+    *                Specifies how we should update the gradient to the args_grad.
+    *                - 'write' means everytime gradient is write to specified args_grad NDArray.
+    *                - 'add' means everytime gradient is add to the specified NDArray.
+    *                - 'null' means no action is taken, the gradient may not be calculated.
+    * @param dataDesc List of dataDescriptors
+    * @return The generated Executor
+    */
+  def simpleBind(ctx: Context, gradReq: String,
+                 descs: IndexedSeq[DataDesc]) : Executor = {
+    val (shapes, types) = descs.map(desc =>
+      ( desc.name -> desc.shape, desc.name -> desc.dtype )).unzip
+    simpleBind(ctx, gradReq, shapes.toMap, types.toMap)
   }
 
   /**
@@ -793,7 +867,7 @@ class Symbol private(private[mxnet] val handle: SymbolHandle) extends WarnIfNotD
     }
 
     val execHandle = new ExecutorHandleRef
-    val sharedHadle = if (sharedExec != null) sharedExec.handle else 0L
+    val sharedHandle = if (sharedExec != null) sharedExec.handle else 0L
     checkCall(_LIB.mxExecutorBindEX(handle,
                                    ctx.deviceTypeid,
                                    ctx.deviceId,
@@ -806,20 +880,25 @@ class Symbol private(private[mxnet] val handle: SymbolHandle) extends WarnIfNotD
                                    argsGradHandle,
                                    reqsArray,
                                    auxArgsHandle,
-                                   sharedHadle,
+                                   sharedHandle,
                                    execHandle))
-    val executor = new Executor(execHandle.value, this.clone())
-    executor.argArrays = argsNDArray
-    executor.gradArrays = argsGradNDArray
-    executor.auxArrays = auxStatesNDArray
-    executor._ctx = new Context(ctx.deviceType, ctx.deviceId)
-    executor._gradsReq = gradsReq
-    executor._group2ctx =
+
+    val executorGroup2ctx =
       if (group2ctx == null) null
       else group2ctx.map { case (key, value) =>
         key -> new Context(value.deviceType, value.deviceId)
       }
-    executor
+
+    // If this is in a scope then we want to create the clone in the same scope
+    var newSymbol: Symbol = null
+    ResourceScope.usingIfScopeExists(this.scope) {
+      newSymbol = this.clone()
+    }
+
+    new Executor(execHandle.value, newSymbol, argsNDArray, argsGradNDArray,
+                                auxStatesNDArray, new Context(ctx.deviceType, ctx.deviceId),
+                                gradsReq, executorGroup2ctx)
+
   }
 
   /**
@@ -832,6 +911,7 @@ class Symbol private(private[mxnet] val handle: SymbolHandle) extends WarnIfNotD
     checkCall(_LIB.mxSymbolSaveToJSON(handle, jsonStr))
     jsonStr.value
   }
+
 }
 
 /**
@@ -846,6 +926,7 @@ object Symbol extends SymbolBase {
   private val bindReqMap = Map("null" -> 0, "write" -> 1, "add" -> 3)
 
   val api = SymbolAPI
+  val random = SymbolRandomAPI
 
   def pow(sym1: Symbol, sym2: Symbol): Symbol = {
     Symbol.createFromListedSymbols("_Power")(Array(sym1, sym2))
@@ -979,7 +1060,9 @@ object Symbol extends SymbolBase {
    * @param stop End of interval.
    * @param step Spacing between values. The default step size is 1.
    * @param repeat Number of times to repeat each element. The default repeat count is 1.
-   * @param infer_range Infer the stop value from output shape
+   * @param infer_range
+   *          When set to True, infer the stop position from the start, step,
+   *          repeat, and output tensor size.
    * @param ctx Device context. Default context is the current default context.
    * @param dType The data type of the `NDArray`. The default datatype is `DType.Float32`.
    * @return NDArray of evenly spaced values in the specified range.
@@ -1185,7 +1268,7 @@ object Symbol extends SymbolBase {
 
   // a more friendly interface for creating symbols
   // all values except symbols in kwargs will be cast to String using its toString() method
-  @Deprecated
+  @deprecated("Use Checked version", "0.1.2")
   def createFromNamedSymbolsNoCheck(
       operator: String, name: String = null, attr: Map[String, String] = null)(
       kwargs: Map[String, Any]): Symbol = {
@@ -1204,7 +1287,7 @@ object Symbol extends SymbolBase {
 
   // a more friendly interface for creating symbols
   // all values except symbols in kwargs will be cast to String using its toString() method
-  @Deprecated
+  @deprecated("Use Checked version", "0.1.2")
   def createFromListedSymbolsNoCheck(
       operator: String, name: String = null, attr: Map[String, String] = null)(
       symbols: Array[Symbol], kwargs: Map[String, Any] = null): Symbol = {

@@ -29,13 +29,17 @@ from .ndarray import NDArray, load
 from . import random
 from . import registry
 from . import ndarray
+from . util import is_np_array
+from . import numpy as _mx_np  # pylint: disable=reimported
+
 
 # inherit str for backward compatibility
 class InitDesc(str):
-    """Descriptor for the initialization pattern.
+    """
+    Descriptor for the initialization pattern.
 
-    Parameter
-    ---------
+    Parameters
+    ----------
     name : str
         Name of variable.
     attrs : dict of str to str
@@ -67,7 +71,7 @@ class Initializer(object):
         print_func : function
             A function that computes statistics of initialized arrays.
             Takes an `NDArray` and returns an `str`. Defaults to mean
-            absolute value str((|x|/size(x)).asscalar()).
+            absolute value str((abs(x)/size(x)).asscalar()).
         """
         self._verbose = verbose
         if print_func is None:
@@ -152,6 +156,18 @@ class Initializer(object):
             elif desc.endswith('beta'):
                 self._init_beta(desc, arr)
                 self._verbose_print(desc, 'beta', arr)
+            elif desc.endswith('min'):
+                self._init_zero(desc, arr)
+                self._verbose_print(desc, 'min', arr)
+            elif desc.endswith('max'):
+                self._init_one(desc, arr)
+                self._verbose_print(desc, 'max', arr)
+            elif desc.endswith('weight_quantize'):
+                self._init_quantized_weight(desc, arr)
+                self._verbose_print(desc, 'weight_quantize', arr)
+            elif desc.endswith('bias_quantize'):
+                self._init_quantized_bias(desc, arr)
+                self._verbose_print(desc, 'bias_quantize', arr)
             else:
                 self._init_default(desc, arr)
 
@@ -196,6 +212,10 @@ class Initializer(object):
             self._init_zero(name, arr)
         elif name.endswith("moving_avg"):
             self._init_zero(name, arr)
+        elif name.endswith('min'):
+            self._init_zero(name, arr)
+        elif name.endswith('max'):
+            self._init_one(name, arr)
         else:
             self._init_default(name, arr)
 
@@ -206,7 +226,7 @@ class Initializer(object):
         c = (2 * f - 1 - f % 2) / (2. * f)
         for i in range(np.prod(shape)):
             x = i % shape[3]
-            y = (i / shape[3]) % shape[2]
+            y = (i // shape[3]) % shape[2]
             weight[i] = (1 - abs(x / f - c)) * (1 - abs(y / f - c))
         arr[:] = weight.reshape(shape)
 
@@ -224,6 +244,9 @@ class Initializer(object):
     def _init_bias(self, _, arr):
         arr[:] = 0.0
 
+    def _init_quantized_bias(self, _, arr):
+        arr[:] = 0
+
     def _init_gamma(self, _, arr):
         arr[:] = 1.0
 
@@ -234,6 +257,10 @@ class Initializer(object):
         """Abstract method to Initialize weight."""
         raise NotImplementedError("Must override it")
 
+    def _init_quantized_weight(self, _, arr):
+        _arr = random.randint(-127, 127, dtype='int32').asnumpy()
+        arr[:] = np.int8(_arr)
+
     def _init_default(self, name, _):
         raise ValueError(
             'Unknown initialization pattern for %s. ' \
@@ -241,6 +268,11 @@ class Initializer(object):
             '"weight", "bias", "gamma" (1.0), and "beta" (0.0).' \
             'Please use mx.sym.Variable(init=mx.init.*) to set initialization pattern' % name)
 
+    def __eq__(self, other):
+        if not isinstance(other, Initializer):
+            return NotImplemented
+        # pylint: disable=unidiomatic-typecheck
+        return type(self) is type(other) and self._kwargs == other._kwargs
 
 # pylint: disable=invalid-name
 _register = registry.get_register_func(Initializer, 'initializer')
@@ -440,6 +472,12 @@ class Constant(Initializer):
     def _init_weight(self, _, arr):
         arr[:] = self.value
 
+    def dumps(self):
+        val = self._kwargs['value']
+        if not np.isscalar(val):
+            self._kwargs['value'] = val.tolist() if isinstance(val, np.ndarray) else val.asnumpy().tolist()
+        return json.dumps([self.__class__.__name__.lower(), self._kwargs])
+
 @register
 class Uniform(Initializer):
     """Initializes weights with random values uniformly sampled from a given range.
@@ -471,7 +509,8 @@ class Uniform(Initializer):
         self.scale = scale
 
     def _init_weight(self, _, arr):
-        random.uniform(-self.scale, self.scale, out=arr)
+        uniform_fn = _mx_np.random.uniform if is_np_array() else random.uniform
+        uniform_fn(-self.scale, self.scale, arr.shape, out=arr)
 
 @register
 class Normal(Initializer):
@@ -504,7 +543,8 @@ class Normal(Initializer):
         self.sigma = sigma
 
     def _init_weight(self, _, arr):
-        random.normal(0, self.sigma, out=arr)
+        normal_fn = _mx_np.random.normal if is_np_array() else random.normal
+        normal_fn(0, self.sigma, arr.shape, out=arr)
 
 @register
 class Orthogonal(Initializer):
@@ -603,9 +643,11 @@ class Xavier(Initializer):
             raise ValueError("Incorrect factor type")
         scale = np.sqrt(self.magnitude / factor)
         if self.rnd_type == "uniform":
-            random.uniform(-scale, scale, out=arr)
+            uniform_fn = _mx_np.random.uniform if is_np_array() else random.uniform
+            uniform_fn(-scale, scale, arr.shape, out=arr)
         elif self.rnd_type == "gaussian":
-            random.normal(0, scale, out=arr)
+            normal_fn = _mx_np.random.normal if is_np_array() else random.normal
+            normal_fn(0, scale, arr.shape, out=arr)
         else:
             raise ValueError("Unknown random type")
 
@@ -618,7 +660,7 @@ class MSRAPrelu(Xavier):
     https://arxiv.org/abs/1502.01852.
 
     This initializer is proposed for initialization related to ReLu activation,
-    it maked some changes on top of Xavier method.
+    it makes some changes on top of Xavier method.
 
     Parameters
     ----------
@@ -646,7 +688,7 @@ class Bilinear(Initializer):
         c = (2 * f - 1 - f % 2) / (2. * f)
         for i in range(np.prod(shape)):
             x = i % shape[3]
-            y = (i / shape[3]) % shape[2]
+            y = (i // shape[3]) % shape[2]
             weight[i] = (1 - abs(x / f - c)) * (1 - abs(y / f - c))
         arr[:] = weight.reshape(shape)
 

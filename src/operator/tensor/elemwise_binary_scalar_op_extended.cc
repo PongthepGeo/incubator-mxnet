@@ -19,8 +19,8 @@
 
 /*!
  *  Copyright (c) 2016 by Contributors
- * \file elemwise_binary_scalar_op.cc
- * \brief CPU Implementation of unary function.
+ * \file elemwise_binary_scalar_op_extended.cc
+ * \brief CPU Implementation of extended binary scalar functions.
  */
 #include "./elemwise_unary_op.h"
 #include "./elemwise_binary_op.h"
@@ -31,7 +31,8 @@ namespace op {
 MXNET_OPERATOR_REGISTER_BINARY_SCALAR(_maximum_scalar)
 .set_attr<FCompute>("FCompute<cpu>", BinaryScalarOp::Compute<cpu, mshadow_op::maximum>)
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseIn{"_backward_maximum_scalar"})
-.add_alias("_MaximumScalar");
+.add_alias("_MaximumScalar")
+.add_alias("_npi_maximum_scalar");
 
 MXNET_OPERATOR_REGISTER_BINARY(_backward_maximum_scalar)
 .add_argument("scalar", "float", "scalar value")
@@ -41,7 +42,8 @@ MXNET_OPERATOR_REGISTER_BINARY(_backward_maximum_scalar)
 MXNET_OPERATOR_REGISTER_BINARY_SCALAR(_minimum_scalar)
 .set_attr<FCompute>("FCompute<cpu>", BinaryScalarOp::Compute<cpu, mshadow_op::minimum>)
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseIn{"_backward_minimum_scalar"})
-.add_alias("_MinimumScalar");
+.add_alias("_MinimumScalar")
+.add_alias("_npi_minimum_scalar");
 
 MXNET_OPERATOR_REGISTER_BINARY(_backward_minimum_scalar)
 .add_argument("scalar", "float", "scalar value")
@@ -72,6 +74,7 @@ MXNET_OPERATOR_REGISTER_BINARY(_backward_rpower_scalar)
   cpu, mshadow_op::rpower_grad>);
 
 MXNET_OPERATOR_REGISTER_BINARY_SCALAR(_hypot_scalar)
+.add_alias("_npi_hypot_scalar")
 .set_attr<FCompute>("FCompute<cpu>", BinaryScalarOp::Compute<
   cpu, mshadow_op::hypot>)
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseIn{ "_backward_hypot_scalar" })
@@ -84,7 +87,8 @@ MXNET_OPERATOR_REGISTER_BINARY(_backward_hypot_scalar)
   cpu, mshadow_op::hypot_grad_left>);
 
 NNVM_REGISTER_OP(smooth_l1)
-  .describe(R"code(Calculate Smooth L1 Loss(lhs, scalar) by summing
+.add_alias("_npx_smooth_l1")
+.describe(R"code(Calculate Smooth L1 Loss(lhs, scalar) by summing
 
 .. math::
 
@@ -111,7 +115,7 @@ Example::
       attrs->parsed = 1.0;
     }
   })
-.set_attr<nnvm::FInferShape>("FInferShape", ElemwiseShape<1, 1>)
+.set_attr<mxnet::FInferShape>("FInferShape", ElemwiseShape<1, 1>)
 .set_attr<nnvm::FInferType>("FInferType", ElemwiseType<1, 1>)
 .set_attr<nnvm::FInplaceOption>("FInplaceOption",
                                 [](const NodeAttrs& attrs){

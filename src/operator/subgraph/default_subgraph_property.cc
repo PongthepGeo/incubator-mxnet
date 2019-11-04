@@ -17,8 +17,6 @@
  * under the License.
  */
 
-#include <vector>
-#include <string>
 #include "./common.h"
 #include "./subgraph_property.h"
 #include "../../imperative/cached_op.h"
@@ -75,6 +73,7 @@ class DefaultSubgraphProperty: public SubgraphProperty {
   }
 };
 
+MXNET_REGISTER_SUBGRAPH_BACKEND(default);
 MXNET_REGISTER_SUBGRAPH_PROPERTY(default, DefaultSubgraphProperty);
 
 }  // namespace op

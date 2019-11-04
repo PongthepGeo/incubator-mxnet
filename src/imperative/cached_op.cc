@@ -32,9 +32,28 @@ DMLC_REGISTER_PARAMETER(CachedOpConfig);
 
 constexpr uint32_t kEidNotExist = std::numeric_limits<uint32_t>::max();
 
+const char CachedOp::FULL[] = "full";
+const char CachedOp::FORWARD[] = "forward";
+const char CachedOp::BACKWARD[] = "backward";
+const char CachedOp::REF_COUNT[] = "ref_count";
+const char CachedOp::MEM_PLAN[] = "mem_plan";
+const char CachedOp::STORAGE_PLAN[] = "storage_plan";
+
+namespace {
+
+std::string AddPrefix(const std::string& prefix,
+                      const std::string& s) {
+  return prefix + "_" + s;
+}
+
+}  // namespace
+
 struct CachedOp::GraphInfo {
   nnvm::Graph fwd_graph;
+  nnvm::Graph grad_graph;
   nnvm::Graph full_graph;
+  std::vector<nnvm::NodeEntry> ograd_entries;
+  std::unordered_map<uint32_t, uint32_t> fwd_input_to_grad_output;
   std::vector<OpReqType> bwd_output_reqs;
   std::vector<uint32_t> bwd_input_eid;
 };
@@ -45,13 +64,171 @@ struct CachedOp::DynamicRuntime {
   std::vector<OpStatePtr> op_states;
 };
 
+void CreateFullGraph(const nnvm::Symbol& sym,
+                     nnvm::Graph* fwd_graph,
+                     nnvm::Graph* grad_graph,
+                     nnvm::Graph* full_graph,
+                     std::vector<nnvm::NodeEntry>* ograd_entries,
+                     std::unordered_map<uint32_t, uint32_t>* fwd_input_to_grad_output) {
+  using namespace nnvm;
+  static const std::vector<const Op*> zero_ops{Op::Get("zeros_like"), Op::Get("_zeros")};
+  static const auto _copy_op = Op::Get("_copy");
+  {
+    NodeEntryMap<size_t> dedup_out;
+    for (const NodeEntry& nodeEntry : sym.outputs) {
+      if (dedup_out.find(nodeEntry) != dedup_out.end()) {
+        NodePtr copy_node = Node::Create();
+        copy_node->attrs.op = _copy_op;
+        copy_node->attrs.name =
+            nodeEntry.node->attrs.name + "_copy" + std::to_string(dedup_out[nodeEntry]++);
+        copy_node->inputs.emplace_back(nodeEntry);
+        if (_copy_op->attr_parser != nullptr) {
+          _copy_op->attr_parser(&(copy_node->attrs));
+        }
+        fwd_graph->outputs.emplace_back(std::move(copy_node));
+      } else {
+        dedup_out.emplace(nodeEntry, 0);
+        fwd_graph->outputs.push_back(nodeEntry);
+      }
+    }
+  }
+
+  bool do_elim_common_expr = dmlc::GetEnv("MXNET_ELIMINATE_COMMON_EXPR", true);
+  if (do_elim_common_expr)
+    *fwd_graph = exec::EliminateCommonExpr(std::move(*fwd_graph));
+
+  // construct backward graph
+  {
+    ograd_entries->reserve(fwd_graph->outputs.size());
+    for (size_t i = 0; i < fwd_graph->outputs.size(); ++i) {
+      nnvm::NodePtr np = Node::Create();
+      np->attrs.name = "_head_grad_" + std::to_string(i);
+      ograd_entries->emplace_back(np);
+    }
+
+    std::vector<NodeEntry> xs;
+    const IndexedGraph& indexed_graph = fwd_graph->indexed_graph();
+    for (size_t i = 0; i < indexed_graph.input_nodes().size(); ++i) {
+      const uint32_t node_id = indexed_graph.input_nodes()[i];
+      if (indexed_graph.mutable_input_nodes().count(node_id))
+        continue;
+      (*fwd_input_to_grad_output)[i] = xs.size();
+      xs.emplace_back(indexed_graph[node_id].weak_ref.lock());
+    }
+
+    CHECK(!xs.empty())
+        << "There are no inputs in computation graph that require gradients.";
+
+    *grad_graph = pass::MXGradient(
+        *fwd_graph, fwd_graph->outputs, xs, *ograd_entries,
+        exec::AggregateGradient, nullptr, nullptr,
+        zero_ops, "_copy");
+  }
+
+  // construct full graph
+  {
+    full_graph->outputs = fwd_graph->outputs;
+    for (const auto& i : grad_graph->outputs) full_graph->outputs.emplace_back(i);
+  }
+}
+
+void SetRefCounts(nnvm::Graph* fwd_graph, const nnvm::Graph& full_graph) {
+  const auto& idx = fwd_graph->indexed_graph();
+  CHECK_GE(idx.input_nodes().size(), 1) << "CachedOp requires at least 1 input";
+
+  std::vector<uint32_t> ref_count(idx.num_node_entries(), 0);
+  for (const auto& i : idx.input_nodes()) ++ref_count[idx.entry_id(i, 0)];
+  for (const auto& i : idx.outputs()) ++ref_count[idx.entry_id(i)];
+  for (size_t i = 0; i < idx.num_nodes(); ++i) {
+    for (const auto& j : idx[i].inputs) ++ref_count[idx.entry_id(j)];
+  }
+
+  fwd_graph->attrs[AddPrefix(CachedOp::FORWARD, CachedOp::REF_COUNT)] =
+      std::make_shared<dmlc::any>(std::move(ref_count));
+
+  size_t num_forward_nodes = idx.num_nodes();
+  size_t num_forward_entries = idx.num_node_entries();
+
+  const auto& full_idx = full_graph.indexed_graph();
+
+  std::vector<uint32_t> temp_ref_count(full_idx.num_node_entries(), 0);
+  for (size_t i = num_forward_nodes; i < full_idx.num_nodes(); ++i) {
+    for (const auto& j : full_idx[i].inputs) {
+       ++temp_ref_count[full_idx.entry_id(j)];
+    }
+  }
+
+  auto full_ref_count = fwd_graph->GetAttr<std::vector<uint32_t> >(AddPrefix(CachedOp::FORWARD,
+                                                                             CachedOp::REF_COUNT));
+  for (size_t i = 0; i < num_forward_entries; ++i) full_ref_count.at(i) += temp_ref_count[i];
+  fwd_graph->attrs[AddPrefix(CachedOp::FULL, CachedOp::REF_COUNT)] =
+      std::make_shared<dmlc::any>(std::move(full_ref_count));
+}
+
+void OptimizeGraph(nnvm::Graph * full_graph, nnvm::Graph * fwd_graph, nnvm::Graph * grad_graph,
+                   const Context& context, size_t num_forward_outputs, const bool inlining) {
+#if MXNET_USE_CUDA && !defined(_WIN32)
+  if (context.dev_mask() == kGPU &&
+      !inlining &&
+      dmlc::GetEnv("MXNET_USE_FUSION", true)) {
+    nnvm::Graph unoptimized_graph;
+    common::CopyGraph(&unoptimized_graph, *full_graph, false);
+
+    if (common::CheckForInputNameDuplicates(unoptimized_graph.indexed_graph())) {
+      full_graph->attrs["num_forward_outputs"] = std::make_shared<nnvm::any>(num_forward_outputs);
+      *full_graph = exec::FusePointwiseForward(std::move(*full_graph));
+      full_graph->attrs["num_forward_outputs"] = std::make_shared<nnvm::any>(num_forward_outputs);
+      *full_graph = exec::FusePointwiseBackward(std::move(*full_graph));
+      // Check the topological order of inputs
+      const auto &original_inputs = unoptimized_graph.indexed_graph().input_nodes();
+      const auto &new_inputs = full_graph->indexed_graph().input_nodes();
+      if (original_inputs.size() != new_inputs.size()) {
+        LOG(WARNING)
+          << "Number of inputs after fusion does not match original number of inputs. "
+          << "This is most probably a bug. Disabling fusion for this run.";
+        *full_graph = unoptimized_graph;
+      } else {
+        for (size_t i = 0; i < new_inputs.size(); ++i) {
+          if (unoptimized_graph.indexed_graph()[original_inputs[i]].source->attrs.name !=
+              full_graph->indexed_graph()[new_inputs[i]].source->attrs.name) {
+            LOG(WARNING) << "Disabling fusion due to altered topological order of inputs.";
+            *full_graph = unoptimized_graph;
+            break;
+          }
+        }
+      }
+    } else {
+      LOG(WARNING)
+        << "Graph contains duplicate names for some of its inputs - fusion is NOT enabled!";
+     }
+  }
+#endif  // MXNET_USE_CUDA
+
+  *fwd_graph = nnvm::Graph();
+  fwd_graph->outputs = std::vector<nnvm::NodeEntry>(full_graph->outputs.begin(),
+                                                    full_graph->outputs.begin() +
+                                                    num_forward_outputs);
+  *grad_graph = nnvm::Graph();
+  grad_graph->outputs = std::vector<nnvm::NodeEntry>(full_graph->outputs.begin() +
+                                                     num_forward_outputs,
+                                                     full_graph->outputs.end());
+  SetRefCounts(fwd_graph, *full_graph);
+}
+
 struct CachedOp::CachedOpState {
   CachedOpState(const Context& context_,
                 const nnvm::Graph& fwd_graph_,
-                const nnvm::Graph& full_graph_) {
+                const nnvm::Graph& full_graph_,
+                const bool inlining_) {
     context = context_;
-    info.fwd_graph = fwd_graph_;
-    info.full_graph = full_graph_;
+    nnvm::Symbol sym;
+    sym.outputs = fwd_graph_.outputs;
+    CreateFullGraph(sym.Copy(), &info.fwd_graph, &info.grad_graph,
+                    &info.full_graph, &info.ograd_entries,
+                    &info.fwd_input_to_grad_output);
+
+    OptimizeGraph(&info.full_graph, &info.fwd_graph, &info.grad_graph,
+                  context_, fwd_graph_.outputs.size(), inlining_);
 
     size_t max_nodes = info.full_graph.indexed_graph().num_nodes();
     size_t max_entries = info.full_graph.indexed_graph().num_node_entries();
@@ -81,6 +258,7 @@ struct CachedOp::CachedOpState {
 
   std::vector<NDArray> buff;
   std::vector<NDArray*> arrays;
+  std::vector<NDArray*> arrays_with_in_out;
   std::vector<OpReqType> array_reqs;
 
   std::vector<OpStatePtr> op_states;
@@ -95,114 +273,44 @@ struct CachedOp::CachedOpState {
 CachedOp::CachedOp(
     const nnvm::Symbol& sym,
     const std::vector<std::pair<std::string, std::string> >& flags) {
-  using namespace nnvm;
-  using namespace imperative;
-  static const std::vector<const Op*> zero_ops{Op::Get("zeros_like"), Op::Get("_zeros")};
-  static const auto _copy = Op::Get("_copy");
   config_.Init(flags);
+  this->dynamic_shape_checked_ = false;
 
   if (config_.static_shape) {
     CHECK(config_.static_alloc) << "static_alloc must be True when static_shape is True";
   }
 
-  // construct forward graph
+  auto grad_graph = nnvm::Graph();
+  std::unordered_map<uint32_t, uint32_t> fwd_input_to_grad_output;
+  CreateFullGraph(sym.Copy(), &fwd_graph_, &grad_graph, &full_graph_,
+                  &ograd_entries_, &fwd_input_to_grad_output);
+
   {
-    NodeEntryMap<int> dedup_out;
-    for (const auto& i : sym.outputs) {
-      if (dedup_out.count(i)) {
-        NodePtr copy_node = Node::Create();
-        copy_node->attrs.op = _copy;
-        copy_node->attrs.name =
-            i.node->attrs.name + "_copy" + std::to_string(dedup_out[i]++);
-        copy_node->inputs.emplace_back(i);
-        if (_copy->attr_parser != nullptr) {
-          _copy->attr_parser(&(copy_node->attrs));
-        }
-        fwd_graph_.outputs.push_back(NodeEntry{copy_node, 0, 0});
-      } else {
-        dedup_out.insert({i, 0});
-        fwd_graph_.outputs.push_back(i);
-      }
-    }
     const auto& idx = fwd_graph_.indexed_graph();
-    CHECK_GE(idx.input_nodes().size(), 1) << "CachedOp requires at least 1 input";
-
-    std::vector<uint32_t> ref_count(idx.num_node_entries(), 0);
-    for (const auto& i : idx.input_nodes()) ++ref_count[idx.entry_id(i, 0)];
-    for (const auto& i : idx.outputs()) ++ref_count[idx.entry_id(i)];
-    for (size_t i = 0; i < idx.num_nodes(); ++i) {
-      for (const auto& j : idx[i].inputs) ++ref_count[idx.entry_id(j)];
-    }
-
-    fwd_graph_.attrs["forward_ref_count"] =
-        std::make_shared<dmlc::any>(std::move(ref_count));
-
+    bwd_output_reqs_ = std::vector<OpReqType>(grad_graph.outputs.size(), kWriteTo);
     inlining_ = !config_.static_alloc &&
         (idx.num_nodes() - idx.input_nodes().size()) <= config_.inline_limit;
   }
 
   // Set params
   {
-    const auto& idx = fwd_graph_.indexed_graph();
+    const auto& indexed_graph = fwd_graph_.indexed_graph();
     if (config_.data_indices.ndim() || config_.param_indices.ndim()) {
       CHECK_EQ(config_.data_indices.ndim() + config_.param_indices.ndim(),
-               idx.input_nodes().size());
+               indexed_graph.input_nodes().size());
     } else {
       std::vector<uint32_t> tmp;
-      for (size_t i = 0; i < idx.input_nodes().size(); ++i) {
-        tmp.push_back(i);
+      tmp.reserve(indexed_graph.input_nodes().size());
+      for (size_t i = 0; i < indexed_graph.input_nodes().size(); ++i) {
+        tmp.emplace_back(i);
       }
       config_.data_indices.assign(tmp.begin(), tmp.end());
     }
   }
 
-  // construct backward graph
+  // Set the backward dependency vectors
   {
-    ograd_entries_.reserve(fwd_graph_.outputs.size());
-    for (size_t i = 0; i < fwd_graph_.outputs.size(); ++i) {
-      ograd_entries_.emplace_back(NodeEntry{Node::Create(), 0, 0});
-    }
-
-    std::vector<NodeEntry> xs;
-    const auto& idx = fwd_graph_.indexed_graph();
-    for (size_t i = 0; i < idx.input_nodes().size(); ++i) {
-      auto nid = idx.input_nodes()[i];
-      if (idx.mutable_input_nodes().count(nid)) continue;
-      fwd_input_to_grad_output_[i] = xs.size();
-      xs.emplace_back(NodeEntry{idx[nid].weak_ref.lock(), 0, 0});
-    }
-
-    CHECK_GT(xs.size(), 0)
-        << "There are no inputs in computation graph that require gradients.";
-
-    grad_graph_ = pass::Gradient(
-        fwd_graph_, fwd_graph_.outputs, xs, ograd_entries_,
-        exec::AggregateGradient, nullptr, nullptr,
-        zero_ops, "_copy");
-  }
-
-  // construct full graph
-  {
-    size_t num_forward_nodes = fwd_graph_.indexed_graph().num_nodes();
-    size_t num_forward_entries = fwd_graph_.indexed_graph().num_node_entries();
-
-    full_graph_.outputs = fwd_graph_.outputs;
-    bwd_output_reqs_ = std::vector<OpReqType>(grad_graph_.outputs.size(), kWriteTo);
-    for (const auto& i : grad_graph_.outputs) full_graph_.outputs.emplace_back(i);
     const auto& idx = full_graph_.indexed_graph();
-
-    std::vector<uint32_t> ref_count(idx.num_node_entries(), 0);
-    for (size_t i = num_forward_nodes; i < idx.num_nodes(); ++i) {
-      for (const auto& j : idx[i].inputs) {
-         ++ref_count[idx.entry_id(j)];
-      }
-    }
-
-    auto full_ref_count = fwd_graph_.GetAttr<std::vector<uint32_t> >("forward_ref_count");
-    for (size_t i = 0; i < num_forward_entries; ++i) full_ref_count[i] += ref_count[i];
-    fwd_graph_.attrs["full_ref_count"] =
-        std::make_shared<dmlc::any>(std::move(full_ref_count));
-
     size_t num_forward_inputs = num_inputs();
     size_t num_forward_outputs = num_outputs();
     for (uint32_t i = 0; i < ograd_entries_.size(); ++i) {
@@ -220,6 +328,8 @@ CachedOp::CachedOp(
       bwd_out_dep_.push_back(i);
     }
   }
+
+  SetRefCounts(&fwd_graph_, full_graph_);
 }
 
 CachedOp::~CachedOp() {
@@ -238,9 +348,12 @@ std::vector<nnvm::NodeEntry> CachedOp::Gradient(
   p->attrs.parsed = node->attrs.parsed;
   p->control_deps.push_back(node);
   p->inputs.reserve(bwd_ograd_dep_.size() + bwd_in_dep_.size() + bwd_out_dep_.size());
-  for (auto i : bwd_ograd_dep_) p->inputs.push_back(ograds[i]);
-  for (auto i : bwd_in_dep_) p->inputs.push_back(node->inputs[i]);
-  for (auto i : bwd_out_dep_) p->inputs.emplace_back(NodeEntry{node, i, 0});
+  for (auto i : bwd_ograd_dep_)
+    p->inputs.push_back(ograds[i]);
+  for (auto i : bwd_in_dep_)
+    p->inputs.push_back(node->inputs[i]);
+  for (auto i : bwd_out_dep_)
+    p->inputs.emplace_back(node, i, 0);
   std::vector<NodeEntry> ret;
   ret.reserve(num_inputs());
   const auto& auxs = mutable_input_nodes();
@@ -251,17 +364,52 @@ std::vector<nnvm::NodeEntry> CachedOp::Gradient(
     uint32_t k = 0;
     for (const auto& i : fwd_graph_.indexed_graph().input_nodes()) {
       if (auxs.count(i)) {
-        ret.emplace_back(NodeEntry{nop, 0, 0});
+        ret.emplace_back(nop);
       } else {
-        ret.emplace_back(NodeEntry{p, k++, 0});
+        ret.emplace_back(p, k++, 0);
       }
     }
   } else {
-    for (uint32_t i = 0; i < num_inputs(); ++i) ret.emplace_back(NodeEntry{p, i, 0});
+    for (uint32_t i = 0; i < num_inputs(); ++i)
+        ret.emplace_back(p, i, 0);
   }
   return ret;
 }
 
+bool CachedOp::CheckDynamicShapeExists(const Context& default_ctx,
+                                       const std::vector<NDArray*>& inputs,
+                                       bool erase_result) {
+  using namespace nnvm;
+  using namespace imperative;
+  if (this->dynamic_shape_checked_) {
+    return config_.is_dynamic;
+  } else {
+    this->dynamic_shape_checked_ = true;
+  }
+  CHECK_EQ(inputs.size(), num_inputs());
+
+  auto state_ptr = GetCachedOpState(default_ctx);
+  auto& state = state_ptr.get_state<CachedOpState>();
+
+  nnvm::Graph& g = state.info.fwd_graph;
+  ShapeVector shape_inputs;
+  shape_inputs.reserve(inputs.size());
+  for (auto input : inputs) {
+    shape_inputs.emplace_back(input->shape());
+  }
+  // We leverage the shape inference pass to detect whether dynamic shape exists.
+  // If so, the pass will fail with `contain_dynamic_shape = true`,
+  // This method is only called once, so the overhead is negligible.
+  bool contain_dynamic_shape = false;
+  CheckAndInferShape(&g, std::move(shape_inputs), true,
+                     {0, 0}, {0, 0},
+                     &contain_dynamic_shape);
+  if (!config_.static_shape && erase_result) {
+    g.attrs.erase("shape");
+    g.attrs.erase("shape_inputs");
+  }
+  return contain_dynamic_shape;
+}
 
 bool CachedOp::SetForwardGraph(
     GraphInfo* info,
@@ -278,23 +426,32 @@ bool CachedOp::SetForwardGraph(
   shape_inputs.reserve(inputs.size());
   dtype_inputs.reserve(inputs.size());
   storage_type_inputs.reserve(inputs.size());
-  for (uint32_t i = 0; i < inputs.size(); ++i) {
-    shape_inputs.emplace_back(inputs[i]->shape());
-    dtype_inputs.emplace_back(inputs[i]->dtype());
-    storage_type_inputs.emplace_back(inputs[i]->storage_type());
+  for (auto input : inputs) {
+    shape_inputs.emplace_back(input->shape());
+    dtype_inputs.emplace_back(input->dtype());
+    storage_type_inputs.emplace_back(input->storage_type());
   }
 
   bool match = true;
-  match &= CheckAndInferShape(&g, std::move(shape_inputs), true);
+  bool contain_dynamic_shape = false;
+  match &= CheckAndInferShape(&g, std::move(shape_inputs), true,
+                              {0, 0}, {0, 0}, &contain_dynamic_shape);
   match &= CheckAndInferType(&g, std::move(dtype_inputs), true);
   exec::DevMaskVector dev_mask(g.indexed_graph().num_nodes(), inputs[0]->ctx().dev_mask());
   match &= CheckAndInferStorageType(&g, std::move(dev_mask),
                                     std::move(storage_type_inputs), true);
 
+  // When dynmaic shape exists, it is not feasible to plan memory ahead of time
+  if (contain_dynamic_shape) {
+    g.attrs.erase(AddPrefix(FORWARD, MEM_PLAN));
+    g.attrs.erase(AddPrefix(FULL, MEM_PLAN));
+    return false;
+  }
+  const std::string& prefix = recording ? FULL : FORWARD;
   if (!match) {
-    g.attrs.erase("forward_mem_plan");
-    g.attrs.erase("full_mem_plan");
-  } else if (g.attrs.count(recording ? "full_mem_plan" : "forward_mem_plan")) {
+    g.attrs.erase(AddPrefix(FORWARD, MEM_PLAN));
+    g.attrs.erase(AddPrefix(FULL, MEM_PLAN));
+  } else if (g.attrs.count(AddPrefix(prefix, MEM_PLAN))) {
     return true;
   }
 
@@ -314,9 +471,9 @@ bool CachedOp::SetForwardGraph(
   }
 
   auto mem_plan = PlanMemory(
-      &g, std::move(storage), g.GetAttr<std::vector<uint32_t> >(
-          recording ? "full_ref_count" : "forward_ref_count"));
-  g.attrs[recording ? "full_mem_plan" : "forward_mem_plan"] =
+      &g, std::move(storage), g.GetAttr<std::vector<uint32_t> >(AddPrefix(prefix, REF_COUNT)),
+      AddPrefix(prefix, STORAGE_PLAN));
+  g.attrs[AddPrefix(prefix, MEM_PLAN)] =
       std::make_shared<dmlc::any>(std::move(mem_plan));
 
   return false;
@@ -362,10 +519,10 @@ bool CachedOp::SetBackwardGraph(
     info->bwd_output_reqs = reqs;
     info->bwd_input_eid.clear();
     g = nnvm::Graph();
-    g.outputs = fwd_graph_.outputs;
-    for (size_t i = 0; i < grad_graph_.outputs.size(); ++i) {
+    g.outputs = info->fwd_graph.outputs;
+    for (size_t i = 0; i < info->grad_graph.outputs.size(); ++i) {
       if (info->bwd_output_reqs[i] == kNullOp) continue;
-      g.outputs.emplace_back(grad_graph_.outputs[i]);
+      g.outputs.emplace_back(info->grad_graph.outputs[i]);
     }
     g.attrs["context"] = std::make_shared<dmlc::any>(
         std::vector<Context>(g.indexed_graph().num_nodes(), default_ctx));
@@ -376,14 +533,14 @@ bool CachedOp::SetBackwardGraph(
   if (info->bwd_input_eid.size() != inputs.size()) {
     info->bwd_input_eid.clear();
     SetBackwardInputEid(bwd_in_dep_, bwd_out_dep_, bwd_ograd_dep_,
-                        ograd_entries_, idx, &info->bwd_input_eid);
+                        info->ograd_entries, idx, &info->bwd_input_eid);
     CHECK_EQ(inputs.size(), info->bwd_input_eid.size());
   }
 
-  size_t num_forward_nodes = fwd_graph_.indexed_graph().num_nodes();
-  size_t num_forward_entries = fwd_graph_.indexed_graph().num_node_entries();
+  size_t num_forward_nodes = info->fwd_graph.indexed_graph().num_nodes();
+  size_t num_forward_entries = info->fwd_graph.indexed_graph().num_node_entries();
 
-  if (!g.attrs.count("backward_ref_count")) {
+  if (!g.attrs.count(AddPrefix(BACKWARD, REF_COUNT))) {
     std::vector<uint32_t> ref_count(idx.num_node_entries(), 0);
     for (size_t i = num_forward_nodes; i < idx.num_nodes(); ++i) {
       for (const auto& j : idx[i].inputs) ++ref_count[idx.entry_id(j)];
@@ -394,11 +551,11 @@ bool CachedOp::SetBackwardGraph(
       }
     }
     for (const auto& i : idx.outputs()) ++ref_count[idx.entry_id(i)];
-    g.attrs["backward_ref_count"] = std::make_shared<dmlc::any>(std::move(ref_count));
+    g.attrs[AddPrefix(BACKWARD, REF_COUNT)] = std::make_shared<dmlc::any>(std::move(ref_count));
   }
 
-  auto shapes = info->fwd_graph.GetAttr<ShapeVector>("shape");
-  shapes.resize(idx.num_node_entries(), TShape());
+  auto shapes = info->fwd_graph.GetAttr<mxnet::ShapeVector>("shape");
+  shapes.resize(idx.num_node_entries(), mxnet::TShape());
   auto dtypes = info->fwd_graph.GetAttr<DTypeVector>("dtype");
   dtypes.resize(idx.num_node_entries(), -1);
   auto stypes = info->fwd_graph.GetAttr<StorageTypeVector>("storage_type");
@@ -427,8 +584,8 @@ bool CachedOp::SetBackwardGraph(
                                     false, node_range, entry_range);
 
   if (!match) {
-    g.attrs.erase("backward_mem_plan");
-  } else if (g.attrs.count("backward_mem_plan")) {
+    g.attrs.erase(AddPrefix(BACKWARD, MEM_PLAN));
+  } else if (g.attrs.count(AddPrefix(BACKWARD, MEM_PLAN))) {
     return true;
   }
 
@@ -442,11 +599,13 @@ bool CachedOp::SetBackwardGraph(
   for (const auto i : idx.outputs()) storage[idx.entry_id(i)] = exec::kExternalStorageID;
 
   auto mem_plan = PlanMemory(
-      &g, std::move(storage), g.GetAttr<std::vector<uint32_t> >("backward_ref_count"),
+      &g, std::move(storage),
+      g.GetAttr<std::vector<uint32_t> >(AddPrefix(BACKWARD, REF_COUNT)),
+      AddPrefix(BACKWARD, STORAGE_PLAN),
       {num_forward_nodes, idx.num_nodes()},
       {num_forward_entries, idx.num_node_entries()},
       detect_inplace_addto);
-  g.attrs["backward_mem_plan"] = std::make_shared<dmlc::any>(std::move(mem_plan));
+  g.attrs[AddPrefix(BACKWARD, MEM_PLAN)] = std::make_shared<dmlc::any>(std::move(mem_plan));
 
   return false;
 }
@@ -460,7 +619,8 @@ OpStatePtr CachedOp::GetCachedOpState(
       return i;
     }
   }
-  auto state_ptr = OpStatePtr::Create<CachedOpState>(ctx, fwd_graph_, full_graph_);
+  auto state_ptr = OpStatePtr::Create<CachedOpState>(ctx, fwd_graph_, full_graph_,
+                                                     inlining_);
 
   cached_op_states_[ctx].push_back(state_ptr);
   return state_ptr;
@@ -477,9 +637,10 @@ void CachedOp::StaticAllocMemory(
   const auto& default_ctx = state.context;
   nnvm::Graph& g = keep_fwd ? state.info.full_graph : state.info.fwd_graph;
   const auto& idx = g.indexed_graph();
-  const auto& vstorage_inplace = g.GetAttr<std::vector<int> >("storage_inplace_index");
-  const auto& mem_plan = g.GetAttr<MemoryPlanVector>(
-      keep_fwd ? "backward_mem_plan" : (recording ? "full_mem_plan" : "forward_mem_plan"));
+  const std::string& graph_type = keep_fwd ? BACKWARD : (recording ? FULL : FORWARD);
+  const auto& storage_plan_attr = AddPrefix(graph_type, STORAGE_PLAN);
+  const auto& storage_plan = g.GetAttr<std::vector<int> >(storage_plan_attr);
+  const auto& mem_plan = g.GetAttr<MemoryPlanVector>(AddPrefix(graph_type, MEM_PLAN));
   std::vector<int> addto_entry;
   if (g.attrs.count("addto_entry")) {
     addto_entry = g.GetAttr<std::vector<int> >("addto_entry");
@@ -509,9 +670,9 @@ void CachedOp::StaticAllocMemory(
   for (size_t i = start_eid; i < end_eid; ++i) {
     if (addto_entry.size() && addto_entry[i]) {
       state.array_reqs[i] = kAddTo;
-    } else if (vstorage_inplace[i] >= 0) {
+    } else if (storage_plan[i] >= 0) {
       state.array_reqs[i] = kWriteInplace;
-    } else if (vstorage_inplace[i] == -2) {
+    } else if (storage_plan[i] == -2) {
       // -2 indicate that the entry is never referenced.
       state.array_reqs[i] = kNullOp;
     } else {
@@ -566,7 +727,7 @@ void CachedOp::StaticInitExec(
     }
   } else {
     for (size_t i = start_nid; i < end_nid; ++i) {
-      exec::CreateOpExecs(g, &state.execs, i);
+      exec::CreateOpExecs(g, &state.execs, &state.op_states, i);
     }
     exec::AttachOpResources(g, state.execs, start_nid, end_nid);
 
@@ -582,15 +743,21 @@ void CachedOp::StaticInitExec(
       SetupOpExec(g, i, state.execs[i], state.arrays, state.array_reqs);
     }
 
+    // Init bulk_size for Inference mode with bulking enabled (= entire forward graph).
     size_t bulk_size = idx.num_nodes();
-    std::unordered_set<uint32_t> excludes;
     if (recording || keep_fwd) {
-      bulk_size = keep_fwd ? config_.backward_bulk_size : config_.forward_bulk_size;
-      for (const auto& i : idx.outputs()) excludes.insert(idx.entry_id(i));
-      for (const auto& i : idx.input_nodes()) excludes.insert(idx.entry_id(i, 0));
+      // Training mode
+      if (!Imperative::PreferBulkExecTrain())
+        bulk_size = 0;
+      else
+        bulk_size = keep_fwd ? config_.backward_bulk_size : config_.forward_bulk_size;
+    } else {
+      // Inference mode
+      if (!Imperative::PreferBulkExecInference())
+        bulk_size = 0;
     }
 
-    CreateEngineOpSeg(idx, default_ctx, start_nid, end_nid, bulk_size, excludes,
+    CreateEngineOpSeg(idx, default_ctx, start_nid, end_nid, bulk_size,
                       state.execs, skip_plus_node, &state.opr_segs);
   }
 
@@ -619,7 +786,7 @@ void CachedOp::StaticRunOps(
   const auto& op_execs = state.execs;
 
   std::vector<NDArray*> ndinputs, ndoutputs;
-  nnvm::ShapeVector arg_shapes;
+  mxnet::ShapeVector arg_shapes;
   nnvm::DTypeVector arg_dtypes;
   std::vector<OpReqType> req;
 
@@ -642,6 +809,9 @@ void CachedOp::StaticRunOps(
         ndinputs.emplace_back(state_arrays[idx.entry_id(j)]);
         CHECK(!ndinputs.back()->is_none());
       }
+      if (monitor_callback_ && monitor_all_) {
+          mxnet::common::ExecuteMonInputCallback(idx, state_arrays, i, monitor_callback_);
+      }
       ndoutputs.clear();
       ndoutputs.reserve(num_outputs);
       req.clear();
@@ -653,17 +823,20 @@ void CachedOp::StaticRunOps(
         CHECK(req.back() == kNullOp || !ndoutputs.back()->is_none());
       }
       const DispatchMode dispatch_mode = dispatch_modes[i];
+
       if (createop.count(node.source->op())) {
         arg_shapes.clear();
         arg_dtypes.clear();
         arg_shapes.reserve(ndinputs.size());
         arg_dtypes.reserve(ndinputs.size());
-        for (size_t i = 0; i < ndinputs.size(); ++i) {
-          arg_shapes.emplace_back(ndinputs[i]->shape());
-          arg_dtypes.emplace_back(ndinputs[i]->dtype());
+        for (auto& ndinput : ndinputs) {
+          arg_shapes.emplace_back(ndinput->shape());
+          arg_dtypes.emplace_back(ndinput->dtype());
         }
-        state.op_states[i] = createop[node.source->op()](
-            node.source->attrs, default_ctx, arg_shapes, arg_dtypes);
+        if (!config_.static_shape) {
+          state.op_states[i] =
+              createop[node.source->op()](node.source->attrs, default_ctx, arg_shapes, arg_dtypes);
+        }
         Imperative::Get()->InvokeOp(
             default_ctx, node.source->attrs, ndinputs, ndoutputs, req,
             dispatch_mode, state.op_states[i]);
@@ -677,6 +850,9 @@ void CachedOp::StaticRunOps(
         Imperative::Get()->InvokeOp(
             default_ctx, node.source->attrs, ndinputs, ndoutputs, req,
             dispatch_mode);
+      }
+      if (monitor_callback_) {
+          mxnet::common::ExecuteMonOutputCallback(idx, state_arrays, i, monitor_callback_);
       }
     }
   }
@@ -706,7 +882,8 @@ OpStatePtr CachedOp::StaticForward(
   // We are going to add input and output arrays to the array list.
   // The input and output arrays should only be valid for this run,
   // so we shouldn't modify the state's array list.
-  auto arrays = state.arrays;
+  state.arrays_with_in_out = state.arrays;
+  auto& arrays = state.arrays_with_in_out;
   if (config_.static_shape) {
     for (auto i : config_.param_indices) {
       auto nid = idx.input_nodes()[i];
@@ -734,7 +911,7 @@ OpStatePtr CachedOp::StaticForward(
   }
 
   const auto& dtypes = g.GetAttr<DTypeVector>("dtype");
-  const auto& shapes = g.GetAttr<ShapeVector>("shape");
+  const auto& shapes = g.GetAttr<mxnet::ShapeVector>("shape");
   const auto& stypes = g.GetAttr<StorageTypeVector>("storage_type");
 
   for (size_t i = 0; i < outputs.size(); ++i) {
@@ -757,7 +934,8 @@ OpStatePtr CachedOp::StaticForward(
 OpStatePtr CachedOp::DynamicForward(
     const Context& default_ctx,
     const std::vector<NDArray*>& inputs,
-    const std::vector<NDArray*>& outputs) {
+    const std::vector<NDArray*>& outputs,
+    bool use_naive_run) {
   using namespace nnvm;
   using namespace imperative;
 
@@ -779,12 +957,13 @@ OpStatePtr CachedOp::DynamicForward(
   auto& states = runtime.op_states;
 
   // Allocate entries
-  states.resize(idx.num_nodes());
   buff.resize(idx.num_node_entries());
-  states.reserve(idx.num_nodes());
+  states.resize(idx.num_nodes());
   std::vector<NDArray*> arrays;
   arrays.reserve(buff.size());
-  for (size_t i = 0; i < buff.size(); ++i) arrays.push_back(&buff[i]);
+  for (auto& buffered_array : buff) {
+    arrays.push_back(&buffered_array);
+  }
   for (size_t i = 0; i < num_inputs; ++i) {
     arrays[idx.entry_id(idx.input_nodes()[i], 0)] = inputs[i];
   }
@@ -795,40 +974,49 @@ OpStatePtr CachedOp::DynamicForward(
   }
 
   // Allocate NDArrays
-  std::vector<uint32_t> ref_count = g.GetAttr<std::vector<uint32_t> >(
-      recording ? "full_ref_count" : "forward_ref_count");
+  const std::string& graph_type = recording ? FULL : FORWARD;
+  std::vector<uint32_t> ref_count =
+    g.GetAttr<std::vector<uint32_t> >(AddPrefix(graph_type, REF_COUNT));
 
   std::vector<OpReqType> array_reqs(arrays.size(), kWriteTo);
   for (size_t i = 0; i < idx.num_node_entries(); ++i) {
     if (ref_count[i] == 0) array_reqs[i] = kNullOp;
   }
-
-  const auto& mem_plan = g.GetAttr<MemoryPlanVector >(
-      recording ? "full_mem_plan" : "forward_mem_plan");
-  AllocateMemory(g, idx, default_ctx, 0, idx.num_node_entries(),
-                 mem_plan, arrays, &array_reqs);
-
-  const auto& dtypes = g.GetAttr<DTypeVector>("dtype");
-  const auto& shapes = g.GetAttr<ShapeVector>("shape");
-  const auto& stypes = g.GetAttr<StorageTypeVector>("storage_type");
-
-  for (size_t i = 0; i < outputs.size(); ++i) {
-    auto eid = idx.entry_id(idx.outputs()[i]);
-    arrays[eid] = outputs[i];
-    if (!outputs[i]->is_none()) continue;
-    *outputs[i] = NDArray(static_cast<NDArrayStorageType>(stypes[eid]),
-                          shapes[eid], default_ctx, true, dtypes[eid]);
-  }
-
   const auto& dispatch_modes = g.GetAttr<DispatchModeVector>("dispatch_mode");
-
-  // If CachedOp is running in the inline mode, it uses RunGraph to record
-  // computation; otherwise, CachedOp records computation itself.
-  // So if it's not the inline mode, we disable recording.
-  RunGraph(false, idx, arrays, 0, idx.num_nodes(), std::move(array_reqs),
-           std::move(ref_count), &states, dispatch_modes,
-           recording && inlining_);
-
+  if (!use_naive_run) {
+    const auto& mem_plan = g.GetAttr<MemoryPlanVector >(AddPrefix(graph_type, MEM_PLAN));
+    AllocateMemory(g, idx, default_ctx, 0, idx.num_node_entries(),
+                  mem_plan, arrays, &array_reqs);
+    const auto& dtypes = g.GetAttr<DTypeVector>("dtype");
+    const auto& shapes = g.GetAttr<mxnet::ShapeVector>("shape");
+    const auto& stypes = g.GetAttr<StorageTypeVector>("storage_type");
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      auto eid = idx.entry_id(idx.outputs()[i]);
+      arrays[eid] = outputs[i];
+      if (!outputs[i]->is_none()) continue;
+      *outputs[i] = NDArray(static_cast<NDArrayStorageType>(stypes[eid]),
+                            shapes[eid], default_ctx, true, dtypes[eid]);
+    }
+    // If CachedOp is running in the inline mode, it uses RunGraph to record
+    // computation; otherwise, CachedOp records computation itself.
+    // So if it's not the inline mode, we disable recording.
+    RunGraph(false, idx, arrays, 0, idx.num_nodes(), std::move(array_reqs),
+            std::move(ref_count), &states, dispatch_modes,
+            recording && inlining_, nullptr, monitor_callback_, monitor_all_);
+  } else {
+    mxnet::ShapeVector shapes = g.GetAttr<mxnet::ShapeVector>("shape");
+    NaiveRunGraph(false, default_ctx, idx, arrays, 0, idx.num_nodes(),
+                  std::move(array_reqs), std::move(ref_count), &states,
+                  dispatch_modes, recording && inlining_, &shapes, monitor_callback_, monitor_all_);
+    {
+      auto state_ptr = GetCachedOpState(default_ctx);
+      auto& state = state_ptr.get_state<CachedOpState>();
+      auto copied_shape = shapes;
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.info.fwd_graph.attrs["shape"] = std::make_shared<dmlc::any>(std::move(copied_shape));
+    }
+    g.attrs["shape"] = std::make_shared<dmlc::any>(std::move(shapes));
+  }
   return op_state;
 }
 
@@ -841,8 +1029,10 @@ OpStatePtr CachedOp::Forward(
   CHECK_EQ(inputs.size(), num_inputs());
 
   Context default_ctx = inputs[0]->ctx();
+  auto state_ptr = GetCachedOpState(default_ctx);
+  auto& state = state_ptr.get_state<CachedOpState>();
 
-  const auto& idx = fwd_graph_.indexed_graph();
+  const auto& idx = state.info.fwd_graph.indexed_graph();
   for (size_t i = 0; i < inputs.size(); ++i) {
     CHECK_EQ(inputs[i]->ctx(), default_ctx)
         << "CachedOp requires all inputs to live on the same context. But "
@@ -855,10 +1045,19 @@ OpStatePtr CachedOp::Forward(
   int prev_bulk_size = Engine::Get()->set_bulk_size(config_.forward_bulk_size);
 
   OpStatePtr op_state;
-  if (config_.static_alloc) {
-    op_state = StaticForward(default_ctx, inputs, outputs);
-  } else {
-    op_state = DynamicForward(default_ctx, inputs, outputs);
+  try {
+    if (config_.is_dynamic || CheckDynamicShapeExists(default_ctx, inputs, true)) {
+      config_.is_dynamic = true;
+      config_.static_alloc = false;
+      op_state = DynamicForward(default_ctx, inputs, outputs, true);
+    } else if (config_.static_alloc) {
+      op_state = StaticForward(default_ctx, inputs, outputs);
+    } else {
+      op_state = DynamicForward(default_ctx, inputs, outputs, false);
+    }
+  } catch (const dmlc::Error& e) {
+    Engine::Get()->set_bulk_size(prev_bulk_size);
+    throw e;
   }
 
   Engine::Get()->set_bulk_size(prev_bulk_size);
@@ -901,13 +1100,15 @@ void CachedOp::DynamicBackward(
   auto& buff = runtime.buff;
   auto& states = runtime.op_states;
 
-  size_t num_forward_outputs = fwd_graph_.outputs.size();
-  size_t num_forward_nodes = fwd_graph_.indexed_graph().num_nodes();
-  size_t num_forward_entries = fwd_graph_.indexed_graph().num_node_entries();
+  size_t num_forward_outputs = runtime.info.fwd_graph.outputs.size();
+  size_t num_forward_nodes = runtime.info.fwd_graph.indexed_graph().num_nodes();
+  size_t num_forward_entries = runtime.info.fwd_graph.indexed_graph().num_node_entries();
   buff.resize(idx.num_node_entries());
   std::vector<NDArray*> arrays;
   arrays.reserve(buff.size());
-  for (size_t i = 0; i < buff.size(); ++i) arrays.push_back(&buff[i]);
+  for (auto& buffered_array : buff) {
+    arrays.push_back(&buffered_array);
+  }
   for (size_t i = 0; i < inputs.size(); ++i) {
     if (runtime.info.bwd_input_eid[i] == kEidNotExist) {
       continue;
@@ -924,7 +1125,7 @@ void CachedOp::DynamicBackward(
   }
 
   // Allocate NDArrays
-  auto ref_count = g.GetAttr<std::vector<uint32_t> >("backward_ref_count");
+  auto ref_count = g.GetAttr<std::vector<uint32_t> >(AddPrefix(BACKWARD, REF_COUNT));
   if (retain_graph) {
     for (size_t i = 0; i < num_forward_entries; ++i) ++ref_count[i];
   }
@@ -940,7 +1141,7 @@ void CachedOp::DynamicBackward(
     if (ref_count[i] == 0) array_reqs[i] = kNullOp;
   }
 
-  const auto& mem_plan = g.GetAttr<MemoryPlanVector >("backward_mem_plan");
+  const auto& mem_plan = g.GetAttr<MemoryPlanVector >(AddPrefix(BACKWARD, MEM_PLAN));
   AllocateMemory(g, idx, default_ctx, num_forward_entries, idx.num_node_entries(),
                  mem_plan, arrays, &array_reqs);
 
@@ -948,7 +1149,7 @@ void CachedOp::DynamicBackward(
 
   RunGraph(retain_graph, idx, arrays, num_forward_nodes, idx.num_nodes(),
            std::move(array_reqs), std::move(ref_count), &states, dispatch_modes,
-           Imperative::Get()->is_recording());
+           Imperative::Get()->is_recording(), nullptr, monitor_callback_);
 
   if (retain_graph) {
     buff.resize(num_forward_entries);
@@ -985,7 +1186,8 @@ void CachedOp::StaticBackward(
   // We are going to add input and output arrays to the array list.
   // The input and output arrays should only be valid for this run,
   // so we shouldn't modify the state's array list.
-  auto arrays = state.arrays;
+  state.arrays_with_in_out = state.arrays;
+  auto& arrays = state.arrays_with_in_out;
   for (size_t i = 0; i < state.info.bwd_input_eid.size(); ++i) {
     auto eid = state.info.bwd_input_eid[i];
     if (eid == kEidNotExist) {
@@ -996,9 +1198,9 @@ void CachedOp::StaticBackward(
 
   if (config_.static_shape) {
     for (auto i : config_.param_indices) {
-      const auto iter = fwd_input_to_grad_output_.find(i);
-      if (iter == fwd_input_to_grad_output_.end()) continue;
-      auto entry = grad_graph_.outputs[iter->second];
+      const auto iter = state.info.fwd_input_to_grad_output.find(i);
+      if (iter == state.info.fwd_input_to_grad_output.end()) continue;
+      auto entry = state.info.grad_graph.outputs[iter->second];
       if (!idx.exist(entry.node.get())) continue;
       auto eid = idx.entry_id(entry);
       if (!arrays[eid]->IsSame(*outputs[iter->second]) ||
@@ -1013,9 +1215,9 @@ void CachedOp::StaticBackward(
       }
     }
     for (auto i : config_.data_indices) {
-      const auto iter = fwd_input_to_grad_output_.find(i);
-      if (iter == fwd_input_to_grad_output_.end()) continue;
-      auto entry = grad_graph_.outputs[iter->second];
+      const auto iter = state.info.fwd_input_to_grad_output.find(i);
+      if (iter == state.info.fwd_input_to_grad_output.end()) continue;
+      auto entry = state.info.grad_graph.outputs[iter->second];
       if (!idx.exist(entry.node.get())) continue;
       auto eid = idx.entry_id(entry);
       state.array_reqs[eid] = reqs[iter->second];
@@ -1025,8 +1227,8 @@ void CachedOp::StaticBackward(
       arrays[eid] = outputs[iter->second];
     }
   } else {
-    for (size_t i = 0; i < grad_graph_.outputs.size(); ++i) {
-      auto entry = grad_graph_.outputs[i];
+    for (size_t i = 0; i < state.info.grad_graph.outputs.size(); ++i) {
+      auto entry = state.info.grad_graph.outputs[i];
       if (!idx.exist(entry.node.get())) continue;
       auto eid = idx.entry_id(entry);
       state.array_reqs[eid] = reqs[i];
@@ -1058,10 +1260,15 @@ void CachedOp::Backward(
 
   int prev_bulk_size = Engine::Get()->set_bulk_size(config_.backward_bulk_size);
 
-  if (config_.static_alloc) {
-    StaticBackward(retain_graph, state, inputs, reqs, outputs);
-  } else {
-    DynamicBackward(retain_graph, state, inputs, reqs, outputs);
+  try {
+    if (config_.static_alloc) {
+      StaticBackward(retain_graph, state, inputs, reqs, outputs);
+    } else {
+      DynamicBackward(retain_graph, state, inputs, reqs, outputs);
+    }
+  } catch (const dmlc::Error& e) {
+    Engine::Get()->set_bulk_size(prev_bulk_size);
+    throw e;
   }
 
   Engine::Get()->set_bulk_size(prev_bulk_size);
@@ -1177,8 +1384,9 @@ void CachedOpBackward(const OpStatePtr& state_ptr,
       in_ptrs.push_back(&(*it));
   }
   CHECK_EQ(in_ptrs.size(), s.op->num_backward_inputs());
-  for (size_t i = 0; i < out_bufs.size(); i++)
-    out_ptrs.push_back(&out_bufs[i]);
+  for (auto& out_buf : out_bufs) {
+    out_ptrs.push_back(&out_buf);
+  }
   CHECK_EQ(out_ptrs.size(), s.op->num_backward_outputs());
   // Set is_training correct for the imperative executor.
   bool orig_is_train;
@@ -1208,9 +1416,19 @@ void CachedOpBackward(const OpStatePtr& state_ptr,
       CopyFromTo(out_bufs[i], outputs[i]);
 }
 
+/*
+ * Register the callback to be called when the operator is executed
+ */
+void CachedOp::RegisterOpHook(const CachedOp::CachedOpMonCallback& callback,
+                              bool monitor_all) {
+    CHECK(callback) << "invalid callback";
+    monitor_callback_ = callback;
+    monitor_all_ = monitor_all;
+}
+
 OpStatePtr CreateCachedOpState(const NodeAttrs& attrs,
                                Context ctx,
-                               const std::vector<TShape>& in_shapes,
+                               const mxnet::ShapeVector& in_shapes,
                                const std::vector<int>& in_types) {
   const CachedOpPtr& op = nnvm::get<CachedOpPtr>(attrs.parsed);
   return OpStatePtr::Create<CachedOpActualState>(op);
@@ -1283,8 +1501,8 @@ void CachedOpParamParser(nnvm::NodeAttrs* attrs) {
     nnvm::Symbol sym;
     sym.outputs = g.outputs;
     std::vector<std::pair<std::string, std::string> > flags;
-    for (auto it = attrs->dict.begin(); it != attrs->dict.end(); it++)
-      flags.emplace_back(it->first, it->second);
+    for (const auto& attr : attrs->dict)
+      flags.emplace_back(attr.first, attr.second);
     attrs->parsed = CachedOpPtr(new CachedOp(sym, flags));
   }
 }
@@ -1315,10 +1533,10 @@ NNVM_REGISTER_OP(_CachedOp)
     return op->ListForwardOutputNames();
   })
 .set_attr<FCreateOpState>("FCreateOpState", CreateCachedOpState)
-.set_attr<nnvm::FInferShape>("FInferShape",
+.set_attr<mxnet::FInferShape>("FInferShape",
   [](const nnvm::NodeAttrs& attrs,
-     std::vector<TShape> *in_shapes,
-     std::vector<TShape> *out_shapes) {
+     mxnet::ShapeVector *in_shapes,
+     mxnet::ShapeVector *out_shapes) {
     const CachedOpPtr& op = nnvm::get<CachedOpPtr>(attrs.parsed);
     return op::DefaultSubgraphOpShapeHelper(op->GetForwardSym(), in_shapes, out_shapes);
   })

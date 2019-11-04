@@ -27,63 +27,17 @@ __version__ = '0.3'
 
 import argparse
 import glob
-import logging
-import os
+import pprint
 import re
 import shutil
+import signal
 import subprocess
-import sys
-import tempfile
 from itertools import chain
 from subprocess import check_call, check_output
 from typing import *
+
+from safe_docker_run import SafeDockerClient
 from util import *
-import docker
-import docker.models
-import docker.errors
-import signal
-import atexit
-import pprint
-
-
-class Cleanup:
-    """A class to cleanup containers"""
-    def __init__(self):
-        self.containers = set()
-        self.docker_stop_timeout = 3
-
-    def add_container(self, container: docker.models.containers.Container):
-        assert isinstance(container, docker.models.containers.Container)
-        self.containers.add(container)
-
-    def remove_container(self, container: docker.models.containers.Container):
-        assert isinstance(container, docker.models.containers.Container)
-        self.containers.remove(container)
-
-    def _cleanup_containers(self):
-        if self.containers:
-            logging.warning("Cleaning up containers")
-        else:
-            return
-        # noinspection PyBroadException
-        try:
-            stop_timeout = int(os.environ.get("DOCKER_STOP_TIMEOUT", self.docker_stop_timeout))
-        except Exception:
-            stop_timeout = 3
-        for container in self.containers:
-            try:
-                container.stop(timeout=stop_timeout)
-                logging.info("☠: stopped container %s", trim_container_id(container.id))
-                container.remove()
-                logging.info("🚽: removed container %s", trim_container_id(container.id))
-            except Exception as e:
-                logging.exception(e)
-        self.containers.clear()
-        logging.info("Cleaning up containers finished.")
-
-    def __call__(self):
-        """Perform cleanup"""
-        self._cleanup_containers()
 
 
 def get_dockerfiles_path():
@@ -92,34 +46,38 @@ def get_dockerfiles_path():
 
 def get_platforms(path: str = get_dockerfiles_path()) -> List[str]:
     """Get a list of architectures given our dockerfiles"""
-    dockerfiles = glob.glob(os.path.join(path, "Dockerfile.build.*"))
+    dockerfiles = glob.glob(os.path.join(path, "Dockerfile.*"))
     dockerfiles = list(filter(lambda x: x[-1] != '~', dockerfiles))
-    files = list(map(lambda x: re.sub(r"Dockerfile.build.(.*)", r"\1", x), dockerfiles))
+    files = list(map(lambda x: re.sub(r"Dockerfile.(.*)", r"\1", x), dockerfiles))
     platforms = list(map(lambda x: os.path.split(x)[1], sorted(files)))
     return platforms
 
 
 def get_docker_tag(platform: str, registry: str) -> str:
     """:return: docker tag to be used for the container"""
-    return "{0}/build.{1}".format(registry, platform)
+    platform = platform if any(x in platform for x in ['build.', 'publish.']) else 'build.{}'.format(platform)
+    if not registry:
+        registry = "mxnet_local"
+    return "{0}/{1}".format(registry, platform)
 
 
 def get_dockerfile(platform: str, path=get_dockerfiles_path()) -> str:
-    return os.path.join(path, "Dockerfile.build.{0}".format(platform))
+    platform = platform if any(x in platform for x in ['build.', 'publish.']) else 'build.{}'.format(platform)
+    return os.path.join(path, "Dockerfile.{0}".format(platform))
 
 
 def get_docker_binary(use_nvidia_docker: bool) -> str:
     return "nvidia-docker" if use_nvidia_docker else "docker"
 
 
-def build_docker(platform: str, docker_binary: str, registry: str, num_retries: int, use_cache: bool) -> str:
+def build_docker(platform: str, docker_binary: str, registry: str, num_retries: int, no_cache: bool) -> str:
     """
     Build a container for the given platform
     :param platform: Platform
     :param docker_binary: docker binary to use (docker/nvidia-docker)
     :param registry: Dockerhub registry name
     :param num_retries: Number of retries to build the docker image
-    :param use_cache: will pass cache_from to docker to use the previously pulled tag
+    :param no_cache: pass no-cache to docker to rebuild the images
     :return: Id of the top level image
     """
     tag = get_docker_tag(platform=platform, registry=registry)
@@ -144,7 +102,9 @@ def build_docker(platform: str, docker_binary: str, registry: str, num_retries: 
            "-f", get_dockerfile(platform),
            "--build-arg", "USER_ID={}".format(os.getuid()),
            "--build-arg", "GROUP_ID={}".format(os.getgid())]
-    if use_cache:
+    if no_cache:
+        cmd.append("--no-cache")
+    elif registry:
         cmd.extend(["--cache-from", tag])
     cmd.extend(["-t", tag, get_dockerfiles_path()])
 
@@ -196,42 +156,31 @@ def default_ccache_dir() -> str:
         ccache_dir = "/tmp/_mxnet_ccache"
         os.makedirs(ccache_dir, exist_ok=True)
         return ccache_dir
-    return os.path.join(tempfile.gettempdir(), "ci_ccache")
+    return os.path.join(os.path.expanduser("~"), ".ccache")
 
 
-def trim_container_id(cid):
-    """:return: trimmed container id"""
-    return cid[:12]
-
-
-def container_run(platform: str,
+def container_run(docker_client: SafeDockerClient,
+                  platform: str,
                   nvidia_runtime: bool,
                   docker_registry: str,
                   shared_memory_size: str,
                   local_ccache_dir: str,
                   command: List[str],
-                  cleanup: Cleanup,
+                  environment: Dict[str, str],
                   dry_run: bool = False) -> int:
     """Run command in a container"""
     container_wait_s = 600
     #
     # Environment setup
     #
-    environment = {
+    environment.update({
         'CCACHE_MAXSIZE': '500G',
         'CCACHE_TEMPDIR': '/tmp/ccache',  # temp dir should be local and not shared
         'CCACHE_DIR': '/work/ccache',  # this path is inside the container as /work/ccache is
                                        # mounted
         'CCACHE_LOGFILE': '/tmp/ccache.log',  # a container-scoped log, useful for ccache
                                               # verification.
-    }
-    # These variables are passed to the container to the process tree killer can find runaway
-    # process inside the container
-    # https://wiki.jenkins.io/display/JENKINS/ProcessTreeKiller
-    # https://github.com/jenkinsci/jenkins/blob/578d6bacb33a5e99f149de504c80275796f0b231/core/src/main/java/hudson/model/Run.java#L2393
-    #
-    jenkins_env_vars = ['BUILD_NUMBER', 'BUILD_ID', 'BUILD_TAG']
-    environment.update({k: os.environ[k] for k in jenkins_env_vars if k in os.environ})
+    })
     environment.update({k: os.environ[k] for k in ['CCACHE_MAXSIZE'] if k in os.environ})
 
     tag = get_docker_tag(platform=platform, registry=docker_registry)
@@ -241,7 +190,7 @@ def container_run(platform: str,
     os.makedirs(local_build_folder, exist_ok=True)
     os.makedirs(local_ccache_dir, exist_ok=True)
     logging.info("Using ccache directory: %s", local_ccache_dir)
-    docker_client = docker.from_env()
+
     # Equivalent command
     docker_cmd_list = [
         get_docker_binary(nvidia_runtime),
@@ -269,8 +218,7 @@ def container_run(platform: str,
     docker_cmd = ' \\\n\t'.join(docker_cmd_list)
     logging.info("Running %s in container %s", command, tag)
     logging.info("Executing the equivalent of:\n%s\n", docker_cmd)
-    # return code of the command inside docker
-    ret = 0
+
     if not dry_run:
         #############################
         #
@@ -282,10 +230,9 @@ def container_run(platform: str,
             # runc is default (docker info | grep -i runtime)
             runtime = 'nvidia'
 
-        container = docker_client.containers.run(
+        return docker_client.run(
             tag,
             runtime=runtime,
-            detach=True,
             command=command,
             shm_size=shared_memory_size,
             user='{}:{}'.format(os.getuid(), os.getgid()),
@@ -299,53 +246,7 @@ def container_run(platform: str,
                     {'bind': '/work/ccache', 'mode': 'rw'},
             },
             environment=environment)
-        logging.info("Started container: %s", trim_container_id(container.id))
-        # Race condition:
-        # If the previous call is interrupted then it's possible that the container is not cleaned up
-        # We avoid by masking the signals temporarily
-        cleanup.add_container(container)
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
-        #
-        #############################
-
-        stream = container.logs(stream=True, stdout=True, stderr=True)
-        sys.stdout.flush()
-        for chunk in stream:
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
-        sys.stdout.flush()
-        stream.close()
-        try:
-            logging.info("Waiting for status of container %s for %d s.",
-                         trim_container_id(container.id),
-                         container_wait_s)
-            wait_result = container.wait(timeout=container_wait_s)
-            logging.info("Container exit status: %s", wait_result)
-            ret = wait_result.get('StatusCode', 200)
-        except Exception as e:
-            logging.exception(e)
-            ret = 150
-
-        # Stop
-        try:
-            logging.info("Stopping container: %s", trim_container_id(container.id))
-            container.stop()
-        except Exception as e:
-            logging.exception(e)
-            ret = 151
-
-        # Remove
-        try:
-            logging.info("Removing container: %s", trim_container_id(container.id))
-            container.remove()
-        except Exception as e:
-            logging.exception(e)
-            ret = 152
-        cleanup.remove_container(container)
-        containers = docker_client.containers.list()
-        if containers:
-            logging.info("Other running containers: %s", [trim_container_id(x.id) for x in containers])
-    return ret
+    return 0
 
 
 def list_platforms() -> str:
@@ -374,15 +275,8 @@ def log_environment():
     logging.debug("Build environment: %s", pp.pformat(dict(os.environ)))
 
 
-def script_name() -> str:
-    """:returns: script name with leading paths removed"""
-    return os.path.split(sys.argv[0])[1]
-
-
 def main() -> int:
-    logging.getLogger().setLevel(logging.INFO)
-    logging.getLogger("requests").setLevel(logging.WARNING)
-    logging.basicConfig(format='{}: %(asctime)-15s %(message)s'.format(script_name()))
+    config_logging()
 
     logging.info("MXNet container based build tool.")
     log_environment()
@@ -394,8 +288,12 @@ def main() -> int:
                         help="platform",
                         type=str)
 
-    parser.add_argument("--build-only",
+    parser.add_argument("-b", "--build-only",
                         help="Only build the container, don't build the project",
+                        action='store_true')
+
+    parser.add_argument("-R", "--run-only",
+                        help="Only run the container, don't rebuild the container",
                         action='store_true')
 
     parser.add_argument("-a", "--all",
@@ -420,7 +318,7 @@ def main() -> int:
                         action='store_true')
 
     parser.add_argument("-d", "--docker-registry",
-                        help="Dockerhub registry name to retrieve cache from. Default is 'mxnetci'",
+                        help="Dockerhub registry name to retrieve cache from.",
                         default='mxnetci',
                         type=str)
 
@@ -429,10 +327,12 @@ def main() -> int:
                         default=1,
                         type=int)
 
-    parser.add_argument("-c", "--no-dockerhub-cache", action="store_true",
-                        help="Disables use of --cache-from option on docker build, allowing docker"
-                        " to use local layers for caching. If absent, we use the cache from dockerhub"
-                        " which is the default.")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="passes --no-cache to docker build")
+
+    parser.add_argument("-e", "--environment", nargs="*", default=[],
+                        help="Environment variables for the docker container. "
+                        "Specify with a list containing either names or name=value")
 
     parser.add_argument("command",
                         help="command to run in the container",
@@ -445,35 +345,26 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    def use_cache():
-        return not args.no_dockerhub_cache or under_ci()
-
     command = list(chain(*args.command))
     docker_binary = get_docker_binary(args.nvidiadocker)
+    docker_client = SafeDockerClient()
 
-    # Cleanup on signals and exit
-    cleanup = Cleanup()
-
-    def signal_handler(signum, _):
-        signal.pthread_sigmask(signal.SIG_BLOCK, {signum})
-        logging.warning("Signal %d received, cleaning up...", signum)
-        cleanup()
-        logging.warning("done. Exiting with error.")
-        sys.exit(1)
-
-    atexit.register(cleanup)
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    environment = dict([(e.split('=')[:2] if '=' in e else (e, os.environ[e]))
+                        for e in args.environment])
 
     if args.list:
         print(list_platforms())
     elif args.platform:
         platform = args.platform
         tag = get_docker_tag(platform=platform, registry=args.docker_registry)
-        if use_cache():
+        if args.docker_registry:
             load_docker_cache(tag=tag, docker_registry=args.docker_registry)
-        build_docker(platform=platform, docker_binary=docker_binary, registry=args.docker_registry,
-                     num_retries=args.docker_build_retries, use_cache=use_cache())
+        if not args.run_only:
+            build_docker(platform=platform, docker_binary=docker_binary, registry=args.docker_registry,
+                         num_retries=args.docker_build_retries, no_cache=args.no_cache)
+        else:
+            logging.info("Skipping docker build step.")
+
         if args.build_only:
             logging.warning("Container was just built. Exiting due to build-only.")
             return 0
@@ -482,23 +373,23 @@ def main() -> int:
         ret = 0
         if command:
             ret = container_run(
-                platform=platform, nvidia_runtime=args.nvidiadocker,
+                docker_client=docker_client, platform=platform, nvidia_runtime=args.nvidiadocker,
                 shared_memory_size=args.shared_memory_size, command=command, docker_registry=args.docker_registry,
-                local_ccache_dir=args.ccache_dir, cleanup=cleanup)
+                local_ccache_dir=args.ccache_dir, environment=environment)
         elif args.print_docker_run:
             command = []
             ret = container_run(
-                platform=platform, nvidia_runtime=args.nvidiadocker,
+                docker_client=docker_client, platform=platform, nvidia_runtime=args.nvidiadocker,
                 shared_memory_size=args.shared_memory_size, command=command, docker_registry=args.docker_registry,
-                local_ccache_dir=args.ccache_dir, dry_run=True, cleanup=cleanup)
+                local_ccache_dir=args.ccache_dir, dry_run=True, environment=environment)
         else:
             # With no commands, execute a build function for the target platform
             command = ["/work/mxnet/ci/docker/runtime_functions.sh", "build_{}".format(platform)]
             logging.info("No command specified, trying default build: %s", ' '.join(command))
             ret = container_run(
-                platform=platform, nvidia_runtime=args.nvidiadocker,
+                docker_client=docker_client, platform=platform, nvidia_runtime=args.nvidiadocker,
                 shared_memory_size=args.shared_memory_size, command=command, docker_registry=args.docker_registry,
-                local_ccache_dir=args.ccache_dir, cleanup=cleanup)
+                local_ccache_dir=args.ccache_dir, environment=environment)
 
         if ret != 0:
             logging.critical("Execution of %s failed with status: %d", command, ret)
@@ -506,14 +397,14 @@ def main() -> int:
 
     elif args.all:
         platforms = get_platforms()
+        platforms = [platform for platform in platforms if 'build.' in platform]
         logging.info("Building for all architectures: %s", platforms)
         logging.info("Artifacts will be produced in the build/ directory.")
         for platform in platforms:
             tag = get_docker_tag(platform=platform, registry=args.docker_registry)
-            if use_cache():
-                load_docker_cache(tag=tag, docker_registry=args.docker_registry)
+            load_docker_cache(tag=tag, docker_registry=args.docker_registry)
             build_docker(platform, docker_binary=docker_binary, registry=args.docker_registry,
-                         num_retries=args.docker_build_retries, use_cache=use_cache())
+                         num_retries=args.docker_build_retries, no_cache=args.no_cache)
             if args.build_only:
                 continue
             shutil.rmtree(buildir(), ignore_errors=True)
@@ -525,9 +416,9 @@ def main() -> int:
                 continue
             command = ["/work/mxnet/ci/docker/runtime_functions.sh", build_platform]
             container_run(
-                platform=platform, nvidia_runtime=args.nvidiadocker,
+                docker_client=docker_client, platform=platform, nvidia_runtime=args.nvidiadocker,
                 shared_memory_size=args.shared_memory_size, command=command, docker_registry=args.docker_registry,
-                local_ccache_dir=args.ccache_dir, cleanup=cleanup)
+                local_ccache_dir=args.ccache_dir, environment=environment)
             shutil.move(buildir(), plat_buildir)
             logging.info("Built files left in: %s", plat_buildir)
 

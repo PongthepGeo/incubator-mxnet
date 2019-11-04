@@ -28,6 +28,7 @@
 #include <dmlc/parameter.h>
 #include <dmlc/concurrency.h>
 #include <dmlc/thread_group.h>
+#include "../initialize.h"
 #include "./threaded_engine.h"
 #include "./thread_pool.h"
 #include "../common/lazy_alloc_array.h"
@@ -76,7 +77,8 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
   void Start() override {
     if (is_worker_) return;
     gpu_worker_nthreads_ = common::GetNumThreadsPerGPU();
-    cpu_worker_nthreads_ = dmlc::GetEnv("MXNET_CPU_WORKER_NTHREADS", 1);
+    // MXNET_CPU_WORKER_NTHREADS
+    cpu_worker_nthreads_ = LibraryInitializer::Get()->cpu_worker_nthreads_;
     gpu_copy_nthreads_ = dmlc::GetEnv("MXNET_GPU_COPY_NTHREADS", 2);
     // create CPU task
     int cpu_priority_nthreads = dmlc::GetEnv("MXNET_CPU_PRIORITY_NTHREADS", 4);
@@ -99,7 +101,7 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
         MSHADOW_CATCH_ERROR(mshadow::SetDevice<gpu>(ctx.dev_id));
         #endif
       }
-      this->ExecuteOprBlock(RunContext{ctx, nullptr}, opr_block);
+      this->ExecuteOprBlock(RunContext{ctx, nullptr, nullptr, false}, opr_block);
     } else {
       if (ctx.dev_mask() == Context::kCPU) {
         // CPU execution.
@@ -244,7 +246,8 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
     this->is_worker_ = true;
 #if MXNET_USE_CUDA
     CHECK(block != nullptr);
-    mshadow::Stream<gpu> *stream;
+    mshadow::Stream<gpu> *stream = nullptr;
+    GPUAuxStream *aux_stream = nullptr;
     do {
       ThreadPool::SetReadyOnDestroy setReady(ready_event);
       // allocate stream
@@ -253,11 +256,12 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
         stream = mshadow::NewStream<gpu>(false, false, ctx.dev_id);
       } else {
         stream = mshadow::NewStream<gpu>(true, MXNET_USE_CUDNN != 0, ctx.dev_id);
+        aux_stream = new GPUAuxStream(stream);
       }
     } while (false);
     // execute task
     OprBlock* opr_block;
-    RunContext run_ctx{ctx, stream};
+    RunContext run_ctx{ctx, stream, aux_stream, false};
     auto* task_queue = &(block->task_queue);
 
     // Don't eat up omp threads for GPU jobs.  They're probably best used elsewhere,
@@ -269,6 +273,8 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
     }
     // Catch exception for CUDA driver shutdown
     MSHADOW_CATCH_ERROR(mshadow::DeleteStream<gpu>(stream));
+    if (aux_stream != nullptr)
+      delete aux_stream;
 #else
     ready_event->signal();
 #endif
@@ -283,7 +289,7 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
                         const std::shared_ptr<dmlc::ManualEvent>& ready_event) {
     this->is_worker_ = true;
     auto* task_queue = &(block->task_queue);
-    RunContext run_ctx{ctx, nullptr};
+    RunContext run_ctx{ctx, nullptr, nullptr, false};
 
     // execute task
     OprBlock* opr_block;

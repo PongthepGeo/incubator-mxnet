@@ -17,13 +17,24 @@
 
 import os
 import mxnet as mx
-from lenet5_common import get_iters
+import numpy as np
 
+def get_iters(mnist, batch_size):
+    """Get MNIST iterators."""
+    train_iter = mx.io.NDArrayIter(mnist['train_data'],
+                                   mnist['train_label'],
+                                   batch_size,
+                                   shuffle=True)
+    val_iter = mx.io.NDArrayIter(mnist['test_data'], mnist['test_label'], batch_size)
+    test_iter = mx.io.NDArrayIter(mnist['test_data'], mnist['test_label'], batch_size)
+    all_test_labels = np.array(mnist['test_label'])
+    return train_iter, val_iter, test_iter, all_test_labels
 
 def lenet5():
     """LeNet-5 Symbol"""
     #pylint: disable=no-member
     data = mx.sym.Variable('data')
+    data = mx.sym.Cast(data, 'float16')
     conv1 = mx.sym.Convolution(data=data, kernel=(5, 5), num_filter=20)
     tanh1 = mx.sym.Activation(data=conv1, act_type="tanh")
     pool1 = mx.sym.Pooling(data=tanh1, pool_type="max",
@@ -39,6 +50,7 @@ def lenet5():
     tanh3 = mx.sym.Activation(data=fc1, act_type="tanh")
     # second fullc
     fc2 = mx.sym.FullyConnected(data=tanh3, num_hidden=10)
+    fc2 = mx.sym.Cast(fc2, 'float32')
     # loss
     lenet = mx.sym.SoftmaxOutput(data=fc2, name='softmax')
     #pylint: enable=no-member

@@ -29,11 +29,16 @@
 #include <vector>
 #include <utility>
 #include <algorithm>
+#include <climits>
 #include "./cast_storage-inl.h"
 #include "../mshadow_op.h"
 #include "../mxnet_op.h"
 #include "../elemwise_op_common.h"
 #include "../../ndarray/ndarray_function.h"
+
+#if MSHADOW_USE_MKL == 1
+#include "../mkl_functions-inl.h"
+#endif  // MSHADOW_USE_MKL == 1
 
 namespace mxnet {
 namespace op {
@@ -69,7 +74,7 @@ class OpBase {
                                const NDArray* clone_from = nullptr) {
     if (req != kNullOp) {
       if (clone_from) {
-        const TShape& ishape = clone_from->storage_shape();
+        const mxnet::TShape& ishape = clone_from->storage_shape();
         dest->CheckAndAllocData(ishape);
         CHECK_EQ(dest->storage_type(), clone_from->storage_type());
         for (size_t i = 0, n = clone_from->aux_shapes().size(); i < n; ++i) {
@@ -140,7 +145,7 @@ class OpBase {
                                                           const TBlob& blob) {
     const size_t dim = blob.shape_.ndim();
     if (dim) {
-      TShape shape({blob.shape_[0], 1});
+      mxnet::TShape shape({blob.shape_[0], 1});
       for (size_t i = 1; i < dim; ++i) {
         shape[1] *= blob.shape_[i];
       }
@@ -177,7 +182,7 @@ class UnaryOp : public OpBase {
     CHECK_EQ(outputs.size(), static_cast<size_t>(n_out))
       << " in operator " << attrs.name;
     static_assert(n_in > 0 && n_out > 0, "Invalid input and/or output count values");
-    const TShape& isshape = inputs[0].storage_shape();
+    const mxnet::TShape& isshape = inputs[0].storage_shape();
     if (!shape_is_none(isshape)) {
       NDArray *output = nullptr;
       for (size_t i = 0, n = inputs.size(); i < n; ++i) {
@@ -188,7 +193,7 @@ class UnaryOp : public OpBase {
         CHECK_EQ(output->shape(), inputs[i].shape());
         CHECK_EQ(output->storage_type(), input.storage_type());
         CHECK_EQ(output->aux_shapes().size(), input.aux_shapes().size());
-        std::vector<TShape> aux_shapes;
+        mxnet::ShapeVector aux_shapes;
         const size_t aux_shape_count = input.aux_shapes().size();
         aux_shapes.reserve(aux_shape_count);
         for (size_t j = 0; j < aux_shape_count; ++j) {
@@ -238,8 +243,27 @@ class UnaryOp : public OpBase {
     mshadow::Stream<xpu> *s = ctx.get_stream<xpu>();
     MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
       MXNET_ASSIGN_REQ_SWITCH(req[0], Req, {
-        mxnet_op::Kernel<mxnet_op::op_with_req<OP, Req>, xpu>::Launch(
-          s, inputs[0].Size(), outputs[0].dptr<DType>(), inputs[0].dptr<DType>());
+        if (inputs[0].Size() != 0) {
+          mxnet_op::Kernel<mxnet_op::op_with_req<OP, Req>, xpu>::Launch(
+            s, inputs[0].Size(), outputs[0].dptr<DType>(), inputs[0].dptr<DType>());
+        }
+      });
+    });
+  }
+
+  template<typename xpu, typename OP>
+  static void ComputeLogic(const nnvm::NodeAttrs& attrs,
+                           const OpContext& ctx,
+                           const std::vector<TBlob>& inputs,
+                           const std::vector<OpReqType>& req,
+                           const std::vector<TBlob>& outputs) {
+    mshadow::Stream<xpu> *s = ctx.get_stream<xpu>();
+    MSHADOW_TYPE_SWITCH_WITH_BOOL(inputs[0].type_flag_, DType, {
+      MXNET_ASSIGN_REQ_SWITCH(req[0], Req, {
+        if (inputs[0].Size() != 0) {
+          mxnet_op::Kernel<mxnet_op::op_with_req<OP, Req>, xpu>::Launch(
+              s, inputs[0].Size(), outputs[0].dptr<bool>(), inputs[0].dptr<DType>());
+        }
       });
     });
   }
@@ -259,6 +283,48 @@ class UnaryOp : public OpBase {
       MapToFCompute<xpu>(attrs, ctx, inputs, req, outputs, Compute<xpu, OP>);
     }
   }
+
+#if MSHADOW_USE_MKL == 1
+  template<typename OP, typename MKL_OP>
+  static void MKL_Compute(const nnvm::NodeAttrs& attrs,
+                          const OpContext& ctx,
+                          const std::vector<TBlob>& inputs,
+                          const std::vector<OpReqType>& req,
+                          const std::vector<TBlob>& outputs) {
+    if (req[0] == kNullOp)  return;
+    auto type_flag = inputs[0].type_flag_;
+    size_t input_size = inputs[0].Size();
+    if ((req[0] == kWriteTo || req[0] == kWriteInplace) &&
+        mkl_func::check_size(input_size) &&
+        mkl_func::check_type(type_flag)) {
+      // set DType as float or double according to type_flag
+      MSHADOW_SGL_DBL_TYPE_SWITCH(type_flag, DType, {
+        MKL_OP::Vectorize(input_size, inputs[0].dptr<DType>(), outputs[0].dptr<DType>());
+      });
+    } else {
+      Compute<cpu, OP>(attrs, ctx, inputs, req, outputs);
+    }
+  }
+
+  template<typename OP, typename MKL_OP>
+  static void MKL_ComputeEx(const nnvm::NodeAttrs& attrs,
+                            const OpContext& ctx,
+                            const std::vector<NDArray>& inputs,
+                            const std::vector<OpReqType>& req,
+                            const std::vector<NDArray>& outputs) {
+    CHECK_EQ(inputs.size(), 1U)
+      << "Invalid input, only one input is allowed";
+    CHECK_EQ(outputs.size(), 1U)
+      << "Invalid output, only one output is allowed";
+    CHECK_NE(inputs[0].storage_type(), kDefaultStorage)
+      << "Operation requires a sparse output storage type";
+    CHECK_NE(outputs[0].storage_type(), kDefaultStorage)
+      << "Operation requires a sparse output storage type";
+    if (inputs[0].storage_shape().Size()) {
+      MapToFCompute<cpu>(attrs, ctx, inputs, req, outputs, MKL_Compute<OP, MKL_OP>);
+    }
+  }
+#endif
 
   template<typename xpu, typename op>
   static void ComputeWithHalf2(const nnvm::NodeAttrs &attrs,
@@ -292,7 +358,7 @@ class UnaryOp : public OpBase {
         break;
       case kAddTo: {
           Stream<xpu> *s = ctx.get_stream<xpu>();
-          MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
+          MSHADOW_TYPE_SWITCH_WITH_BOOL(outputs[0].type_flag_, DType, {
             mxnet_op::Kernel<mxnet_op::op_with_req<mshadow_op::identity, kAddTo>, xpu>::Launch(
               s, inputs[0].Size(), outputs[0].dptr<DType>(), inputs[0].dptr<DType>());
           });
@@ -359,7 +425,7 @@ struct CastParam : public dmlc::Parameter<CastParam> {
   int dtype;
   DMLC_DECLARE_PARAMETER(CastParam) {
     DMLC_DECLARE_FIELD(dtype)
-    MXNET_ADD_ALL_TYPES
+    MXNET_ADD_ALL_TYPES_WITH_BOOL
     .describe("Output data type.");
   }
 };
@@ -383,11 +449,14 @@ void CastCompute(const nnvm::NodeAttrs& attrs,
   using namespace mshadow;
   using namespace mshadow::expr;
   Stream<xpu> *s = ctx.get_stream<xpu>();
-  MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DstDType, {
+  MSHADOW_TYPE_SWITCH_WITH_BOOL(outputs[0].type_flag_, DstDType, {
     Tensor<xpu, 1, DstDType> out = outputs[0].FlatTo1D<xpu, DstDType>(s);
-    MSHADOW_TYPE_SWITCH(inputs[0].type_flag_, SrcDType, {
+    MSHADOW_TYPE_SWITCH_WITH_BOOL(inputs[0].type_flag_, SrcDType, {
       Tensor<xpu, 1, SrcDType> data = inputs[0].FlatTo1D<xpu, SrcDType>(s);
-      Assign(out, req[0], tcast<DstDType>(data));
+      if (outputs[0].type_flag_ != inputs[0].type_flag_ ||
+          req[0] != kWriteInplace) {
+        Assign(out, req[0], tcast<DstDType>(data));
+      }
     });
   });
 }
@@ -508,18 +577,133 @@ struct ReshapeLikeParam : public dmlc::Parameter<ReshapeLikeParam> {
   }
 };
 
+struct AroundParam : public dmlc::Parameter<AroundParam> {
+  int decimals;
+  DMLC_DECLARE_PARAMETER(AroundParam) {
+    DMLC_DECLARE_FIELD(decimals)
+      .set_default(0)
+      .describe("Number of decimal places to round to.");
+  }
+};
+
+template<int req>
+struct around_forward {
+  template<typename DType>
+  MSHADOW_XINLINE static void Map(int i, DType* out_data, const DType* in_data,
+                                  const int decimals) {
+    int d = 0;
+    DType temp = in_data[i];
+    DType roundtemp;
+    while (d != decimals) {
+      if (decimals > 0) {
+        d++;
+        temp *= 10;
+      } else {
+        d--;
+        temp /= 10;
+      }
+    }
+    roundtemp = (DType)round(static_cast<double>(temp));
+    // If temp is x.5 and roundtemp is odd number, decrease or increase roundtemp by 1.
+    // For example, in numpy, around(0.5) should be 0 but in c, round(0.5) is 1.
+    if (roundtemp - temp == 0.5 && (static_cast<int>(roundtemp)) % 2 != 0) {
+      roundtemp -= 1;
+    } else if (temp - roundtemp == 0.5 && (static_cast<int>(roundtemp)) % 2 != 0) {
+      roundtemp += 1;
+    }
+    while (d != 0) {
+      if (roundtemp == 0) {
+        break;
+      }
+      if (decimals > 0) {
+        d--;
+        roundtemp /= 10;
+      } else {
+        d++;
+        roundtemp *= 10;
+      }
+    }
+    KERNEL_ASSIGN(out_data[i], req, roundtemp);
+  }
+};
+
+template<typename xpu>
+void AroundOpForward(const nnvm::NodeAttrs& attrs,
+                     const OpContext& ctx,
+                     const std::vector<TBlob>& inputs,
+                     const std::vector<OpReqType>& req,
+                     const std::vector<TBlob>& outputs) {
+  CHECK_EQ(inputs.size(), 1U);
+  CHECK_EQ(outputs.size(), 1U);
+  CHECK_EQ(req.size(), 1U);
+  mshadow::Stream<xpu> *s = ctx.get_stream<xpu>();
+  const TBlob& in_data = inputs[0];
+  const TBlob& out_data = outputs[0];
+  const AroundParam& param = nnvm::get<AroundParam>(attrs.parsed);
+  using namespace mxnet_op;
+  // if the type is uint8, int8, int32 or int64 and decimals is greater than 0
+  // we simply return the number back.
+  if (in_data.type_flag_ >= mshadow::kUint8 && in_data.type_flag_ <= mshadow::kInt64 \
+     && param.decimals > 0) {
+    MSHADOW_TYPE_SWITCH(out_data.type_flag_, DType, {
+      Kernel<mshadow_op::identity_with_cast, xpu>::Launch(
+        s, out_data.Size(), out_data.dptr<DType>(), in_data.dptr<DType>());
+    });
+  } else {
+    MSHADOW_TYPE_SWITCH(out_data.type_flag_, DType, {
+      MXNET_ASSIGN_REQ_SWITCH(req[0], req_type, {
+        Kernel<around_forward<req_type>, xpu>::Launch(
+          s, out_data.Size(), out_data.dptr<DType>(), in_data.dptr<DType>(),
+          param.decimals);
+      });
+    });
+  }
+}
+
 /*! \brief Unary compute */
 #define MXNET_OPERATOR_REGISTER_UNARY(__name$)                      \
   NNVM_REGISTER_OP(__name$)                                         \
   .set_num_inputs(1)                                                \
   .set_num_outputs(1)                                               \
-  .set_attr<nnvm::FInferShape>("FInferShape", ElemwiseShape<1, 1>)  \
+  .set_attr<mxnet::FInferShape>("FInferShape", ElemwiseShape<1, 1>) \
   .set_attr<nnvm::FInferType>("FInferType", ElemwiseType<1, 1>)     \
   .set_attr<nnvm::FInplaceOption>("FInplaceOption",                 \
     [](const NodeAttrs& attrs){                                     \
       return std::vector<std::pair<int, int> >{{0, 0}};             \
     })                                                              \
   .add_argument("data", "NDArray-or-Symbol", "The input array.")
+
+#if MSHADOW_USE_MKL == 1
+  /*! \bried MKL Unary compute.
+   *  With this macro means mxnet compile with MKL to accelerate math function with mkl.
+   *  Will Register FCompute with UnaryOp::MKL_Compute() to compelet the math function.
+  */
+  #define MXNET_MKL_OPERATOR_REGISTER_UNARY_WITH_RSP_CSR(__name$, __xpu$,                          \
+                                                         __kernel$, __mkl_kernel$)                 \
+    MXNET_OPERATOR_REGISTER_UNARY(__name$)                                                         \
+    MXNET_ADD_SPARSE_OP_ALIAS(__name$)                                                             \
+    .set_attr<FInferStorageType>("FInferStorageType", ElemwiseStorageType<1, 1,                    \
+                                 false, true, true>)                                               \
+    .set_attr<FCompute>("FCompute<" #__xpu$ ">", UnaryOp::MKL_Compute<__kernel$, __mkl_kernel$>)   \
+    .set_attr<FComputeEx>("FComputeEx<" #__xpu$ ">", UnaryOp::ComputeEx<__xpu$, __kernel$>)
+
+  /*! \bried MKL Unary compute.
+   *  With this macro means mxnet compile with MKL to accelerate math function with mkl.
+   *  Will Register FCompute with UnaryOp::MKL_Compute() to compelet the math function.
+  */
+  #define MXNET_MKL_OPERATOR_REGISTER_UNARY_WITH_RSP(__name$, __xpu$, __kernel$, __mkl_kernel$)    \
+    MXNET_OPERATOR_REGISTER_UNARY(__name$)                                                         \
+    MXNET_ADD_SPARSE_OP_ALIAS(__name$)                                                             \
+    .set_attr<FInferStorageType>("FInferStorageType", ElemwiseStorageType<1, 1,                    \
+                                 false, true, false>)                                              \
+    .set_attr<FCompute>("FCompute<" #__xpu$ ">", UnaryOp::MKL_Compute<__kernel$, __mkl_kernel$>)   \
+    .set_attr<FComputeEx>("FComputeEx<" #__xpu$ ">", UnaryOp::MKL_ComputeEx<__xpu$, __kernel$>)
+
+  #define MXNET_MKL_OPERATOR_REGISTER_UNARY_WITH_SPARSE_DR(__name$, __xpu$, __kernel$,             \
+                                                           __mkl_kernel$)                          \
+    MXNET_OPERATOR_REGISTER_UNARY(__name$)                                                         \
+    .set_attr<FCompute>("FCompute<" #__xpu$ ">", UnaryOp::MKL_Compute<__kernel$, __mkl_kernel$>)
+#endif
 
 /*! \brief Unary compute, with FComputeEx for csr and rsp available  */
 #define MXNET_OPERATOR_REGISTER_UNARY_WITH_RSP_CSR(__name$, __xpu$, __kernel$)                     \

@@ -27,14 +27,14 @@ package AI::MXNet::NDArray;
     AI::MXNet::NDArray - Imperative tensor operations on CPU/GPU
     In AI::MXNet, NDArray is the core data structure for all mathematical computations.
     An NDArray represents a multidimensional, fixed-size homogenous array.
-    If you’re familiar with the PDL, you might notice some similarities.
+    If you're familiar with the PDL, you might notice some similarities.
     However, NDArray is row-major, unlike the PDL that is column-major.
     Like the PDL, MXNet’s NDArray enables imperative computation.
 
     Some NDArray advandages compared to PDL:
-    MXNet’s NDArray supports fast execution on a wide range of hardware configurations, including CPU, GPU, and multi-GPU machines.
+    MXNet's NDArray supports fast execution on a wide range of hardware configurations, including CPU, GPU, and multi-GPU machines.
     MXNet also scales to distributed systems in the cloud.
-    MXNet’s NDArray executes code lazily, allowing it to automatically parallelize multiple operations across the available hardware.
+    MXNet's NDArray executes code lazily, allowing it to automatically parallelize multiple operations across the available hardware.
 
     An NDArray is a multidimensional array of numbers with the same type.
     We could represent the coordinates of a point in 3D space, e.g. [2, 1, 6] as a 1D array with shape (3).
@@ -43,9 +43,9 @@ package AI::MXNet::NDArray;
 
     [[0, 1, 2]
      [3, 4, 5]]
-    Note that here the use of “dimension” is overloaded. When we say a 2D array, we mean an array with 2 axes, not an array with two components.
+    Note that here the use of 'dimension' is overloaded. When we say a 2D array, we mean an array with 2 axes, not an array with two components.
 
-    Each NDArray supports some important attributes that you’ll often want to query:
+    Each NDArray supports some important attributes that you'll often want to query:
 
     $ndarray->shape: The dimensions of the array.
     It is an array ref of integers indicating the length of the array along each axis.
@@ -59,6 +59,7 @@ package AI::MXNet::NDArray;
 
 use strict;
 use warnings;
+use AI::MXNet::NS;
 use AI::MXNet::Base;
 use AI::MXNet::NDArray::Slice;
 use AI::MXNet::Context;
@@ -115,7 +116,11 @@ method STORABLE_thaw($cloning, $buf, $writable)
 
 method split_array(@args)
 {
-     $self->shape->[0] > 1 ? $self->split(num_outputs => $self->shape->[0], squeeze_axis => @{ $self->shape } > 1 ? 1 : 0, axis => 0) : [$self];
+    my $shape = $self->shape;
+    return [] if $shape->[0] == 0;
+    my $list = $self->split(num_outputs=>$shape->[0],
+        squeeze_axis=>int(@$shape > 1), axis=>0);
+    $shape->[0] == 1 ? [ $list ] : $list;
 }
 
 method at(Index @indices)
@@ -535,7 +540,7 @@ method wait_to_read()
 
 method shape()
 {
-    return scalar(check_call(AI::MXNetCAPI::NDArrayGetShape($self->handle)));
+    return scalar(check_call(AI::MXNetCAPI::NDArrayGetShapeEx($self->handle)));
 }
 
 =head2 size
@@ -1226,6 +1231,9 @@ method concatenate(ArrayRef[AI::MXNet::NDArray] $arrays, Index :$axis=0, :$alway
     :$repeat=1 : number, optional
         The repeating time of all elements.
         E.g repeat=3, the element a will be repeated three times --> a, a, a.
+    :$infer_range=0 : Bool
+        When set to 1, infer stop position from start, step, repeat, and
+        output tensor size.
     :$ctx : Context, optional
         The context of the NDArray, defaultw to current default context.
     :$dtype : data type, optional
@@ -1237,7 +1245,7 @@ method concatenate(ArrayRef[AI::MXNet::NDArray] $arrays, Index :$axis=0, :$alway
         The created NDArray
 =cut
 
-method arange(Index :$start=0, Maybe[Index] :$stop=, Index :$step=1, Index :$repeat=1,
+method arange(Index :$start=0, Maybe[Index] :$stop=, Index :$step=1, Index :$repeat=1, Bool :$infer_range=0,
               AI::MXNet::Context :$ctx=AI::MXNet::Context->current_ctx, Dtype :$dtype='float32')
 {
     return __PACKAGE__->_arange({
@@ -1246,6 +1254,7 @@ method arange(Index :$start=0, Maybe[Index] :$stop=, Index :$step=1, Index :$rep
                 step => $step,
                 repeat => $repeat,
                 dtype => $dtype,
+                infer_range => $infer_range,
                 ctx => "$ctx"
     });
 }
@@ -1456,7 +1465,7 @@ func _new_alloc_handle($shape, $ctx, $delay_alloc, $dtype)
 method _new_from_shared_mem($shared_pid, $shared_id, $shape, $dtype)
 {
     my $hdl = check_call(
-        AI::MXNetCAPI::NDArrayCreateFromSharedMem(
+        AI::MXNetCAPI::NDArrayCreateFromSharedMemEx(
             $shared_pid,
             $shared_id,
             $shape,

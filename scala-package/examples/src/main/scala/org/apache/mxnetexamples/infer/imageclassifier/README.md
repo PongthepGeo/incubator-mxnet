@@ -1,3 +1,20 @@
+<!--- Licensed to the Apache Software Foundation (ASF) under one -->
+<!--- or more contributor license agreements.  See the NOTICE file -->
+<!--- distributed with this work for additional information -->
+<!--- regarding copyright ownership.  The ASF licenses this file -->
+<!--- to you under the Apache License, Version 2.0 (the -->
+<!--- "License"); you may not use this file except in compliance -->
+<!--- with the License.  You may obtain a copy of the License at -->
+
+<!---   http://www.apache.org/licenses/LICENSE-2.0 -->
+
+<!--- Unless required by applicable law or agreed to in writing, -->
+<!--- software distributed under the License is distributed on an -->
+<!--- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY -->
+<!--- KIND, either express or implied.  See the License for the -->
+<!--- specific language governing permissions and limitations -->
+<!--- under the License. -->
+
 # Image Classification
 
 This folder contains an example for image classification with the [MXNet Scala Infer API](https://github.com/apache/incubator-mxnet/tree/master/scala-package/infer).
@@ -19,7 +36,7 @@ The following example shows recognized object classes with corresponding probabi
 
 1. MXNet
 2. MXNet Scala Package
-3. [IntelliJ IDE (or alternative IDE) project setup](http://mxnet.incubator.apache.org/tutorials/scala/mxnet_scala_on_intellij.html) with the MXNet Scala Package
+3. [IntelliJ IDE (or alternative IDE) project setup](https://mxnet.apache.org/api/scala/docs/tutorials/mxnet_scala_on_intellij) with the MXNet Scala Package
 4. wget
 
 

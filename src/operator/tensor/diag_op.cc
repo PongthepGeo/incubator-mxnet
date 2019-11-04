@@ -20,7 +20,7 @@
 /*!
 * Copyright (c) 2015 by Contributors
 * \file diag_op.cc
-* \brief
+* \brief CPU implementation of diag operator
 * \author Istvan Fehervari, Zhijingcheng Yu
 */
 
@@ -92,7 +92,7 @@ Examples::
   [](const NodeAttrs& attrs) {
     return std::vector<std::string>{"data"};
   })
-.set_attr<nnvm::FInferShape>("FInferShape", DiagOpShape)
+.set_attr<mxnet::FInferShape>("FInferShape", DiagOpShape)
 .set_attr<nnvm::FInferType>("FInferType", DiagOpType)
 .set_attr<FCompute>("FCompute<cpu>", DiagOpForward<cpu>)
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseNone{"_backward_diag"})

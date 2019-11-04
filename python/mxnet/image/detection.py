@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# pylint: disable=unused-import
+# pylint: disable=unused-import, too-many-lines
 """Read images and perform augmentations for object detection."""
 
 from __future__ import absolute_import, print_function
@@ -34,6 +34,8 @@ from .. import io
 from .image import RandomOrderAug, ColorJitterAug, LightingAug, ColorNormalizeAug
 from .image import ResizeAug, ForceResizeAug, CastAug, HueJitterAug, RandomGrayAug
 from .image import fixed_crop, ImageIter, Augmenter
+from ..util import is_np_array
+from .. import numpy as _mx_np  # pylint: disable=reimported
 
 
 class DetAugmenter(object):
@@ -658,19 +660,26 @@ class ImageDetIter(ImageIter):
         Data name for provided symbols.
     label_name : str
         Name for detection labels
+    last_batch_handle : str, optional
+        How to handle the last batch.
+        This parameter can be 'pad'(default), 'discard' or 'roll_over'.
+        If 'pad', the last batch will be padded with data starting from the begining
+        If 'discard', the last batch will be discarded
+        If 'roll_over', the remaining elements will be rolled over to the next iteration
     kwargs : ...
         More arguments for creating augmenter. See mx.image.CreateDetAugmenter.
     """
     def __init__(self, batch_size, data_shape,
                  path_imgrec=None, path_imglist=None, path_root=None, path_imgidx=None,
                  shuffle=False, part_index=0, num_parts=1, aug_list=None, imglist=None,
-                 data_name='data', label_name='label', **kwargs):
+                 data_name='data', label_name='label', last_batch_handle='pad', **kwargs):
         super(ImageDetIter, self).__init__(batch_size=batch_size, data_shape=data_shape,
                                            path_imgrec=path_imgrec, path_imglist=path_imglist,
                                            path_root=path_root, path_imgidx=path_imgidx,
                                            shuffle=shuffle, part_index=part_index,
                                            num_parts=num_parts, aug_list=[], imglist=imglist,
-                                           data_name=data_name, label_name=label_name)
+                                           data_name=data_name, label_name=label_name,
+                                           last_batch_handle=last_batch_handle)
 
         if aug_list is None:
             self.auglist = CreateDetAugmenter(data_shape, **kwargs)
@@ -745,18 +754,17 @@ class ImageDetIter(ImageIter):
         if data_shape is not None:
             self.check_data_shape(data_shape)
             self.provide_data = [(self.provide_data[0][0], (self.batch_size,) + data_shape)]
+            self.data_shape = data_shape
         if label_shape is not None:
             self.check_label_shape(label_shape)
             self.provide_label = [(self.provide_label[0][0], (self.batch_size,) + label_shape)]
+            self.label_shape = label_shape
 
-    def next(self):
-        """Override the function for returning next batch."""
+    def _batchify(self, batch_data, batch_label, start=0):
+        """Override the helper function for batchifying data"""
+        i = start
         batch_size = self.batch_size
-        c, h, w = self.data_shape
-        batch_data = nd.zeros((batch_size, c, h, w))
-        batch_label = nd.empty(self.provide_label[0][1])
-        batch_label[:] = -1
-        i = 0
+        array_fn = _mx_np.array if is_np_array() else nd.array
         try:
             while i < batch_size:
                 label, s = self.next_sample()
@@ -773,7 +781,7 @@ class ImageDetIter(ImageIter):
                     assert i < batch_size, 'Batch size must be multiples of augmenter output length'
                     batch_data[i] = self.postprocess_data(datum)
                     num_object = label.shape[0]
-                    batch_label[i][0:num_object] = nd.array(label)
+                    batch_label[i][0:num_object] = array_fn(label)
                     if num_object < batch_label[i].shape[0]:
                         batch_label[i][num_object:] = -1
                     i += 1
@@ -781,7 +789,54 @@ class ImageDetIter(ImageIter):
             if not i:
                 raise StopIteration
 
-        return io.DataBatch([batch_data], [batch_label], batch_size - i)
+        return i
+
+    def next(self):
+        """Override the function for returning next batch."""
+        batch_size = self.batch_size
+        c, h, w = self.data_shape
+        # if last batch data is rolled over
+        if self._cache_data is not None:
+            # check both the data and label have values
+            assert self._cache_label is not None, "_cache_label didn't have values"
+            assert self._cache_idx is not None, "_cache_idx didn't have values"
+            batch_data = self._cache_data
+            batch_label = self._cache_label
+            i = self._cache_idx
+        else:
+            if is_np_array():
+                zeros_fn = _mx_np.zeros
+                empty_fn = _mx_np.empty
+            else:
+                zeros_fn = nd.zeros
+                empty_fn = nd.empty
+            batch_data = zeros_fn((batch_size, c, h, w))
+            batch_label = empty_fn(self.provide_label[0][1])
+            batch_label[:] = -1
+            i = self._batchify(batch_data, batch_label)
+        # calculate the padding
+        pad = batch_size - i
+        # handle padding for the last batch
+        if pad != 0:
+            if self.last_batch_handle == 'discard':
+                raise StopIteration
+            # if the option is 'roll_over', throw StopIteration and cache the data
+            if self.last_batch_handle == 'roll_over' and \
+                self._cache_data is None:
+                self._cache_data = batch_data
+                self._cache_label = batch_label
+                self._cache_idx = i
+                raise StopIteration
+
+            _ = self._batchify(batch_data, batch_label, i)
+            if self.last_batch_handle == 'pad':
+                self._allow_read = False
+            else:
+                self._cache_data = None
+                self._cache_label = None
+                self._cache_idx = None
+
+        return io.DataBatch([batch_data], [batch_label], pad=pad)
 
     def augmentation_transform(self, data, label):  # pylint: disable=arguments-differ
         """Override Transforms input data with specified augmentations."""

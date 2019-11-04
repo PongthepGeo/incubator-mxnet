@@ -31,6 +31,8 @@ import numpy as np
 from .. import dataset
 from ...utils import download, check_sha1, _get_repo_file_url
 from .... import nd, image, recordio, base
+from .... import numpy as _mx_np  # pylint: disable=reimported
+from ....util import is_np_array
 
 
 class MNIST(dataset._DownloadedDataset):
@@ -45,10 +47,9 @@ class MNIST(dataset._DownloadedDataset):
     train : bool, default True
         Whether to load the training or testing set.
     transform : function, default None
-        A user defined callback that transforms each sample. For example:
-    ::
+        A user defined callback that transforms each sample. For example::
 
-        transform=lambda data, label: (data.astype(np.float32)/255, label)
+            transform=lambda data, label: (data.astype(np.float32)/255, label)
 
     """
     def __init__(self, root=os.path.join(base.data_dir(), 'datasets', 'mnist'),
@@ -82,13 +83,16 @@ class MNIST(dataset._DownloadedDataset):
         with gzip.open(label_file, 'rb') as fin:
             struct.unpack(">II", fin.read(8))
             label = np.frombuffer(fin.read(), dtype=np.uint8).astype(np.int32)
+            if is_np_array():
+                label = _mx_np.array(label, dtype=label.dtype)
 
         with gzip.open(data_file, 'rb') as fin:
             struct.unpack(">IIII", fin.read(16))
             data = np.frombuffer(fin.read(), dtype=np.uint8)
             data = data.reshape(len(label), 28, 28, 1)
 
-        self._data = nd.array(data, dtype=data.dtype)
+        array_fn = _mx_np.array if is_np_array() else nd.array
+        self._data = array_fn(data, dtype=data.dtype)
         self._label = label
 
 
@@ -106,10 +110,9 @@ class FashionMNIST(MNIST):
     train : bool, default True
         Whether to load the training or testing set.
     transform : function, default None
-        A user defined callback that transforms each sample. For example:
-    ::
+        A user defined callback that transforms each sample. For example::
 
-        transform=lambda data, label: (data.astype(np.float32)/255, label)
+            transform=lambda data, label: (data.astype(np.float32)/255, label)
 
     """
     def __init__(self, root=os.path.join(base.data_dir(), 'datasets', 'fashion-mnist'),
@@ -130,7 +133,7 @@ class FashionMNIST(MNIST):
 class CIFAR10(dataset._DownloadedDataset):
     """CIFAR10 image classification dataset from https://www.cs.toronto.edu/~kriz/cifar.html
 
-    Each sample is an image (in 3D NDArray) with shape (32, 32, 1).
+    Each sample is an image (in 3D NDArray) with shape (32, 32, 3).
 
     Parameters
     ----------
@@ -139,10 +142,9 @@ class CIFAR10(dataset._DownloadedDataset):
     train : bool, default True
         Whether to load the training or testing set.
     transform : function, default None
-        A user defined callback that transforms each sample. For example:
-    ::
+        A user defined callback that transforms each sample. For example::
 
-        transform=lambda data, label: (data.astype(np.float32)/255, label)
+            transform=lambda data, label: (data.astype(np.float32)/255, label)
 
     """
     def __init__(self, root=os.path.join(base.data_dir(), 'datasets', 'cifar10'),
@@ -186,14 +188,15 @@ class CIFAR10(dataset._DownloadedDataset):
         data = np.concatenate(data)
         label = np.concatenate(label)
 
-        self._data = nd.array(data, dtype=data.dtype)
-        self._label = label
+        array_fn = _mx_np.array if is_np_array() else nd.array
+        self._data = array_fn(data, dtype=data.dtype)
+        self._label = array_fn(label, dtype=label.dtype) if is_np_array() else label
 
 
 class CIFAR100(CIFAR10):
     """CIFAR100 image classification dataset from https://www.cs.toronto.edu/~kriz/cifar.html
 
-    Each sample is an image (in 3D NDArray) with shape (32, 32, 1).
+    Each sample is an image (in 3D NDArray) with shape (32, 32, 3).
 
     Parameters
     ----------
@@ -204,10 +207,9 @@ class CIFAR100(CIFAR10):
     train : bool, default True
         Whether to load the training or testing set.
     transform : function, default None
-        A user defined callback that transforms each sample. For example:
-    ::
+        A user defined callback that transforms each sample. For example::
 
-        transform=lambda data, label: (data.astype(np.float32)/255, label)
+            transform=lambda data, label: (data.astype(np.float32)/255, label)
 
     """
     def __init__(self, root=os.path.join(base.data_dir(), 'datasets', 'cifar100'),
@@ -238,14 +240,12 @@ class ImageRecordDataset(dataset.RecordFileDataset):
     filename : str
         Path to rec file.
     flag : {0, 1}, default 1
-        If 0, always convert images to greyscale.
-
+        If 0, always convert images to greyscale. \
         If 1, always convert images to colored (RGB).
     transform : function, default None
-        A user defined callback that transforms each sample. For example:
-    ::
+        A user defined callback that transforms each sample. For example::
 
-        transform=lambda data, label: (data.astype(np.float32)/255, label)
+            transform=lambda data, label: (data.astype(np.float32)/255, label)
 
     """
     def __init__(self, filename, flag=1, transform=None):
@@ -262,7 +262,9 @@ class ImageRecordDataset(dataset.RecordFileDataset):
 
 
 class ImageFolderDataset(dataset.Dataset):
-    """A dataset for loading image files stored in a folder structure like::
+    """A dataset for loading image files stored in a folder structure.
+
+    like::
 
         root/car/0001.jpg
         root/car/xxxa.jpg
@@ -279,10 +281,9 @@ class ImageFolderDataset(dataset.Dataset):
         If 0, always convert loaded images to greyscale (1 channel).
         If 1, always convert loaded images to colored (3 channels).
     transform : callable, default None
-        A function that takes data and label and transforms them:
-    ::
+        A function that takes data and label and transforms them::
 
-        transform = lambda data, label: (data.astype(np.float32)/255, label)
+            transform = lambda data, label: (data.astype(np.float32)/255, label)
 
     Attributes
     ----------

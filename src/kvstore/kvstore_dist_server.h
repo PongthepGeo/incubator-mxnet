@@ -344,7 +344,8 @@ class KVStoreDistServer {
   }
 
   inline void ApplyUpdates(const DataHandleType type, const int key,
-                           UpdateBuf *update_buf, ps::KVServer<char>* server) {
+                           const ps::KVPairs<char>& req_data, UpdateBuf *update_buf,
+                           ps::KVServer<char>* server) {
     if (!sync_mode_ || update_buf->request.size() == (size_t) ps::NumWorkers()) {
       // let the main thread to execute updater_, which is necessary for python
       auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
@@ -364,7 +365,16 @@ class KVStoreDistServer {
         LOG(INFO) << "sent response to " << update_buf->request.size() << " workers";
       }
       for (const auto& req : update_buf->request) {
-        server->Response(req);
+        /**
+         * Request can be for either push, pull or pushpull
+         * If pull flag is set, respond immediately with the updated values
+         * Otherwise, only send the notification
+         */
+        if (req.pull) {
+          DefaultStorageResponse(type, key, req, req_data, server);
+        } else {
+          server->Response(req);
+        }
       }
       update_buf->request.clear();
       if (has_multi_precision_copy(type)) CopyFromTo(stored, store_[key]);
@@ -459,7 +469,7 @@ class KVStoreDistServer {
     auto unit_len = req_data.lens[1] / num_bytes;
     CHECK_GT(unit_len, 0);
     size_t ds[] = {num_rows, (size_t) unit_len};
-    TShape dshape(ds, ds + 2);
+    mxnet::TShape dshape(ds, ds + 2);
     CHECK_EQ(req_data.vals.size(), num_rows * unit_len * num_bytes);
     TBlob recv_blob;
     MSHADOW_REAL_TYPE_SWITCH(dtype, DType, {
@@ -532,7 +542,7 @@ class KVStoreDistServer {
                                        true, merged_dtype);
             }  // else nothing to aggregate
             updates.request.push_back(req_meta);
-            ApplyUpdates(type, master_key, &updates, server);
+            ApplyUpdates(type, master_key, req_data, &updates, server);
           } else {
             server->Response(req_meta);
           }
@@ -546,7 +556,7 @@ class KVStoreDistServer {
           // data
           TBlob idx_blob(indices.data(), mshadow::Shape1(num_rows), cpu::kDevMask);
           size_t ds[] = {(size_t) num_rows, (size_t) unit_len};
-          TShape dshape(ds, ds + 2);
+          mxnet::TShape dshape(ds, ds + 2);
           TBlob recv_blob;
           MSHADOW_REAL_TYPE_SWITCH(type.dtype, DType, {
             recv_blob = TBlob(reinterpret_cast<DType*>(req_data.vals.data()),
@@ -570,7 +580,7 @@ class KVStoreDistServer {
             AccumulateRowSparseGrads(type, recved, &updates);
           }
           updates.request.push_back(req_meta);
-          ApplyUpdates(type, master_key, &updates, server);
+          ApplyUpdates(type, master_key, req_data, &updates, server);
         }
       }
     } else {
@@ -620,12 +630,12 @@ class KVStoreDistServer {
       auto& stored = store_[key];
 
       size_t ds[] = {(size_t)req_data.lens[1] / mshadow::mshadow_sizeof(type.dtype)};
-      TShape dshape(ds, ds + 1);
+      mxnet::TShape dshape(ds, ds + 1);
       TBlob recv_blob(reinterpret_cast<real_t*>(req_data.vals.data()), dshape, cpu::kDevMask);
       NDArray recved = NDArray(recv_blob, 0);
 
       NDArray decomp_buf = decomp_buf_[key];
-      dshape = TShape{(int64_t) original_size};
+      dshape = mxnet::TShape{(int64_t) original_size};
 
       if (decomp_buf.is_none()) {
         decomp_buf = NDArray(dshape, Context());
@@ -649,7 +659,7 @@ class KVStoreDistServer {
           merged.merged += decomp_buf;
         }
         merged.request.push_back(req_meta);
-        ApplyUpdates(type, key, &merged, server);
+        ApplyUpdates(type, key, req_data, &merged, server);
       } else {
         // async push
         gradient_compression_->Dequantize(recved, &decomp_buf, 0);
@@ -684,7 +694,7 @@ class KVStoreDistServer {
     // the operators with \a NDArray are actually finished
     if (req_meta.push) {
       size_t ds[] = {(size_t) req_data.lens[0] / mshadow::mshadow_sizeof(type.dtype)};
-      TShape dshape(ds, ds + 1);
+      mxnet::TShape dshape(ds, ds + 1);
       TBlob recv_blob;
       MSHADOW_REAL_TYPE_SWITCH(type.dtype, DType, {
         recv_blob = TBlob(reinterpret_cast<DType*>(req_data.vals.data()), dshape, cpu::kDevMask);
@@ -732,7 +742,7 @@ class KVStoreDistServer {
           }
         }
         updates.request.push_back(req_meta);
-        ApplyUpdates(type, key, &updates, server);
+        ApplyUpdates(type, key, req_data, &updates, server);
       }
     } else {
       DefaultStorageResponse(type, key, req_meta, req_data, server);

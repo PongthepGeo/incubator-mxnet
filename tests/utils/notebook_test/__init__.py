@@ -31,8 +31,8 @@ import nbformat
 
 
 IPYTHON_VERSION = 4  # Pin to ipython version 4.
-TIME_OUT = 10*60  # Maximum 10 mins/test. Reaching timeout causes test failure.
-RETRIES = 8
+TIME_OUT = 15*60  # Maximum 10 mins/test. Reaching timeout causes test failure.
+ATTEMPTS = 8
 KERNEL_ERROR_MSG = 'Kernel died before replying to kernel_info'
 
 
@@ -80,23 +80,28 @@ def run_notebook(notebook, notebook_dir, kernel=None, no_cache=False, temp_dir='
         else:
             eprocessor = ExecutePreprocessor(timeout=TIME_OUT)
 
+        success = False
         # There is a low (< 1%) chance that starting a notebook executor will fail due to the kernel
         # taking to long to start, or a port collision, etc.
-        for i in range(RETRIES):
+        for i in range(ATTEMPTS):
             try:
                 nb, _ = eprocessor.preprocess(notebook, {'metadata': {'path': working_dir}})
+                success = True
             except RuntimeError as rte:
                 # We check if the exception has to do with the Jupyter kernel failing to start. If
-                # not, we rethrow to prevent the notebook from erring RETRIES times. It is not ideal
-                # to inspect the exception message, but necessary for retry logic, as Jupyter client
-                # throws the generic RuntimeError that can be confused with other Runtime errors.
+                # not, we rethrow to prevent the notebook from erring ATTEMPTS times. It is not
+                # ideal to inspect the exception message, but necessary for retry logic, as Jupyter
+                # client throws the generic RuntimeError that can be confused with other Runtime
+                # errors.
                 if str(rte) != KERNEL_ERROR_MSG:
                     raise rte
 
-                logging.info("Error starting preprocessor: {}. Attempt {}/{}".format(str(rte), i+1, RETRIES))
+                logging.info("Error starting preprocessor: {}. Attempt {}/{}".format(str(rte), i+1, ATTEMPTS))
                 time.sleep(1)
                 continue
             break
+        if not success:
+            errors.append("Error: Notebook failed to run after {} attempts.".format(ATTEMPTS))
     except Exception as err:
         err_msg = str(err)
         errors.append(err_msg)
@@ -106,7 +111,7 @@ def run_notebook(notebook, notebook_dir, kernel=None, no_cache=False, temp_dir='
             nbformat.write(notebook, output_file)
             output_nb = io.open(output_file, mode='r', encoding='utf-8')
             for line in output_nb:
-                if "Warning:" in line:
+                if "Warning:" in line and "numpy operator signatures" not in line:
                     errors.append("Warning:\n" + line)
         if len(errors) > 0:
             logging.error('\n'.join(errors))

@@ -83,6 +83,15 @@ struct OpContext {
   inline mshadow::Stream<xpu>* get_stream() const {
     return run_ctx.get_stream<xpu>();
   }
+#if MXNET_USE_CUDA
+  /*!
+   * \brief get auxilary gpu stream auto-syncing object from Context
+   * \return the aux stream auto-syncing object
+   */
+  inline SyncedGPUAuxStream get_gpu_aux_stream() const {
+    return run_ctx.get_gpu_aux_stream();
+  }
+#endif
 };
 
 /*! \brief the execution type of the operator */
@@ -120,6 +129,16 @@ enum class DispatchMode {
   kFComputeFallback,
   // special dispatch mode for variables
   kVariable,
+};
+
+/*! \brief the quantization type of the operator */
+enum class QuantizeType {
+  // This operator doesn't support quantization
+  kNone = 0,
+  // This operator can get huge benefit from quantization, thus must be quantized
+  kMust,
+  // This operator support quantization, but will be decided depending on the connection
+  kSupport,
 };
 
 /*!
@@ -197,8 +216,19 @@ class OpStatePtr {
  */
 using FCreateOpState = std::function<OpStatePtr (const NodeAttrs& attrs,
                                                  Context ctx,
-                                                 const std::vector<TShape>& in_shape,
+                                                 const mxnet::ShapeVector& in_shape,
                                                  const std::vector<int>& in_type)>;
+
+/*!
+ * \brief Whether the operator always produces the same
+ *        output given the same input.
+ *        This enables certain optimizations
+ *        like common expression elimination.
+ *
+ * \note Register under "THasDeterministicOutput"
+ */
+using THasDeterministicOutput = bool;
+
 /*!
  * \brief Execution mode of this operator.
  */
@@ -238,6 +268,8 @@ using FResourceRequest = std::function<
 /*!
  * \brief The resource request from the operator.
  *        An operator could register ResourceRequestEx, or ResourceRequest, or neither.
+ *        If an operator registers both ResourceRequestEx and ResourceRequest,
+ *        ResourceRequest is ignored.
  *
  * \note Register under "FResourceRequestEx"
  */
@@ -254,7 +286,7 @@ using FNDArrayFunction = std::function<void (const nnvm::NodeAttrs& attrs,
                                              const std::vector<NDArray>& inputs,
                                              std::vector<NDArray>* outputs)>;
 /*!
- * \brief Resiger a compute function for simple stateless forward only operator
+ * \brief Register a compute function for simple stateless forward only operator
  *
  * \note Register under "FCompute<cpu>" and "FCompute<gpu>"
  */
@@ -264,7 +296,7 @@ using FCompute = std::function<void (const nnvm::NodeAttrs& attrs,
                                      const std::vector<OpReqType>& req,
                                      const std::vector<TBlob>& outputs)>;
 /*!
- * \brief Resiger an NDArray compute function for simple stateless forward only operator
+ * \brief Register an NDArray compute function for simple stateless forward only operator
  * \note Register under "FComputeEx<xpu>" and "FComputeEx<xpu>"
  *       Dispatched only when inferred dispatch_mode is FDispatchComputeEx
  */
@@ -275,7 +307,7 @@ using FComputeEx = std::function<void (const nnvm::NodeAttrs& attrs,
                                        const std::vector<NDArray>& outputs)>;
 
 /*!
- * \brief Resiger a storage and dispatch mode inference function based on
+ * \brief Register a storage and dispatch mode inference function based on
  *        storage types of the inputs and outputs, and the dev_mask for the operator.
  *
  * \note Register under "FInferStorageType"
@@ -290,6 +322,12 @@ using FInferStorageType = std::function<bool (const NodeAttrs& attrs,
  * \brief Register a quantized node creation function based on the attrs of the node
  * \note Register under "FQuantizedOp" for non-quantized operators
  */
+using FQuantizable = std::function<QuantizeType (const NodeAttrs& attrs)>;
+
+/*!
+ * \brief Register a quantized node creation function based on the attrs of the node
+ * \note Register under "FQuantizedOp" for non-quantized operators
+ */
 using FQuantizedOp = std::function<nnvm::NodePtr (const NodeAttrs& attrs)>;
 
 /*!
@@ -299,6 +337,28 @@ using FQuantizedOp = std::function<nnvm::NodePtr (const NodeAttrs& attrs)>;
  * \note Register under "FNeedRequantize" for non-quantized operators
  */
 using FNeedRequantize = std::function<bool (const NodeAttrs& attrs)>;
+
+/*!
+ * \brief Register a function to determine if the input of a quantized operator
+ * needs to be quantized. This is usually used for the quantized operators
+ * which can handle fp32 inputs directly.
+ */
+using FAvoidQuantizeInput = std::function<bool (const NodeAttrs& attrs,
+                                                size_t index)>;
+
+/*!
+ * \brief Register a function to determine if the input of a quantized operator
+ * needs to be calibrated. This is usually used for the quantized operators
+ * which need calibration on its input.
+ */
+using FNeedCalibrateInput = std::function<std::vector<int> (const NodeAttrs& attrs)>;
+
+/*!
+ * \brief Register a function to determine if the output of a quantized operator
+ * needs to be calibrated. This is usually used for the quantized operators
+ * which need calibration on its output.
+ */
+using FNeedCalibrateOutput = std::function<std::vector<int> (const NodeAttrs& attrs)>;
 
 }  // namespace mxnet
 

@@ -72,7 +72,7 @@ struct GPUStreamScope {
     : opContext_(*opContext) {
     CHECK_EQ(opContext_.run_ctx.stream == nullptr, true)
       << "Invalid runtime context stream state";
-    opContext_.run_ctx.stream = mshadow::NewStream<gpu>(true, true);
+    opContext_.run_ctx.stream = mshadow::NewStream<gpu>(true, true, opContext_.run_ctx.ctx.dev_id);
     CHECK_EQ(opContext_.run_ctx.stream != nullptr, true)
       << "Unable to allocate a GPU stream";
   }
@@ -153,9 +153,9 @@ struct OpInfo {
   /*! \brief The operator data */
   std::shared_ptr< OperatorExecutor > executor_;
   /*! \brief The operator prop class */
-  std::shared_ptr<OperatorProp>                         prop_;
+  std::shared_ptr<OperatorProp> prop_;
   /*! \brief The input type(s) */
-  std::vector<int>                                      in_type_;
+  std::vector<int> in_type_;
 };
 
 /*! \brief Pair of op info objects, generally for validating ops against each other */
@@ -281,8 +281,8 @@ static test::op::OpInfo<OperatorProp, OperatorExecutor> createOpAndInfoF(const k
   return info;
 }
 
-inline std::vector<TShape> ShapesOf(const std::vector<NDArray>& arrays) {
-  std::vector<TShape> res;
+inline mxnet::ShapeVector ShapesOf(const std::vector<NDArray>& arrays) {
+  mxnet::ShapeVector res;
   res.reserve(arrays.size());
   for (const NDArray& ar : arrays) {
     res.emplace_back(ar.shape());

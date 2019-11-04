@@ -44,67 +44,96 @@ KNOWN_VCVARS = {
 class BuildFlavour(Enum):
     WIN_CPU = 'WIN_CPU'
     WIN_CPU_MKLDNN = 'WIN_CPU_MKLDNN'
+    WIN_CPU_MKLDNN_MKL = 'WIN_CPU_MKLDNN_MKL'
+    WIN_CPU_MKL = 'WIN_CPU_MKL'
     WIN_GPU = 'WIN_GPU'
     WIN_GPU_MKLDNN = 'WIN_GPU_MKLDNN'
 
 
 CMAKE_FLAGS = {
-    'WIN_CPU': ('-DUSE_CUDA=0 '
-                '-DUSE_CUDNN=0 '
-                '-DUSE_NVRTC=0 '
-                '-DUSE_OPENCV=1 '
-                '-DUSE_OPENMP=1 '
-                '-DUSE_PROFILER=1 '
-                '-DUSE_BLAS=open '
-                '-DUSE_LAPACK=1 '
-                '-DUSE_DIST_KVSTORE=0 '
-                '-DBUILD_CPP_EXAMPLES=1 '
-                '-DUSE_MKL_IF_AVAILABLE=0 '
-                '-DCMAKE_BUILD_TYPE=Release')
+    'WIN_CPU': (
+        '-DUSE_CUDA=OFF '
+        '-DUSE_CUDNN=OFF '
+        '-DUSE_NVRTC=OFF '
+        '-DUSE_OPENCV=ON '
+        '-DUSE_OPENMP=ON '
+        '-DUSE_BLAS=open '
+        '-DUSE_LAPACK=ON '
+        '-DUSE_DIST_KVSTORE=OFF '
+        '-DBUILD_CPP_EXAMPLES=ON '
+        '-DUSE_MKL_IF_AVAILABLE=OFF '
+        '-DCMAKE_BUILD_TYPE=Release')
 
-    , 'WIN_CPU_MKLDNN': ('-DUSE_CUDA=0 '
-                         '-DUSE_CUDNN=0 '
-                         '-DUSE_NVRTC=0 '
-                         '-DUSE_OPENCV=1 '
-                         '-DUSE_OPENMP=1 '
-                         '-DUSE_PROFILER=1 '
-                         '-DUSE_BLAS=open '
-                         '-DUSE_LAPACK=1 '
-                         '-DUSE_DIST_KVSTORE=0 '
-                         '-DUSE_MKL_IF_AVAILABLE=1 '
-                         '-DCMAKE_BUILD_TYPE=Release')
+    , 'WIN_CPU_MKLDNN': (
+        '-DUSE_CUDA=OFF '
+        '-DUSE_CUDNN=OFF '
+        '-DUSE_NVRTC=OFF '
+        '-DUSE_OPENCV=ON '
+        '-DUSE_OPENMP=ON '
+        '-DUSE_BLAS=open '
+        '-DUSE_LAPACK=ON '
+        '-DUSE_DIST_KVSTORE=OFF '
+        '-DUSE_MKL_IF_AVAILABLE=ON '
+        '-DUSE_MKLDNN=ON '
+        '-DCMAKE_BUILD_TYPE=Release')
 
-    , 'WIN_GPU': ('-DUSE_CUDA=1 '
-                  '-DUSE_CUDNN=1 '
-                  '-DUSE_NVRTC=1 '
-                  '-DUSE_OPENCV=1  '
-                  '-DUSE_OPENMP=1 '
-                  '-DUSE_PROFILER=1 '
-                  '-DUSE_BLAS=open '
-                  '-DUSE_LAPACK=1 '
-                  '-DUSE_DIST_KVSTORE=0 '
-                  '-DCUDA_ARCH_NAME=Manual '
-                  '-DCUDA_ARCH_BIN=52 '
-                  '-DCUDA_ARCH_PTX=52 '
-                  '-DCMAKE_CXX_FLAGS="/FS /MD /O2 /Ob2" '
-                  '-DUSE_MKL_IF_AVAILABLE=0 '
-                  '-DCMAKE_BUILD_TYPE=Release')
+    , 'WIN_CPU_MKLDNN_MKL': (
+        '-DUSE_CUDA=OFF '
+        '-DUSE_CUDNN=OFF '
+        '-DUSE_NVRTC=OFF '
+        '-DUSE_OPENCV=ON '
+        '-DUSE_OPENMP=ON '
+        '-DUSE_BLAS=mkl '
+        '-DUSE_LAPACK=ON '
+        '-DUSE_DIST_KVSTORE=OFF '
+        '-DUSE_MKL_IF_AVAILABLE=ON '
+        '-DUSE_MKLDNN=ON '
+        '-DCMAKE_BUILD_TYPE=Release')
 
-    , 'WIN_GPU_MKLDNN': ('-DUSE_CUDA=1 '
-                         '-DUSE_CUDNN=1 '
-                         '-DUSE_NVRTC=1 '
-                         '-DUSE_OPENCV=1 '
-                         '-DUSE_OPENMP=1 '
-                         '-DUSE_PROFILER=1 '
-                         '-DUSE_BLAS=open '
-                         '-DUSE_LAPACK=1 '
-                         '-DUSE_DIST_KVSTORE=0 '
-                         '-DCUDA_ARCH_NAME=Manual '
-                         '-DCUDA_ARCH_BIN=52 '
-                         '-DCUDA_ARCH_PTX=52 '
-                         '-DUSE_MKLDNN=1 '
-                         '-DCMAKE_CXX_FLAGS="/FS /MD /O2 /Ob2" '
-                         '-DCMAKE_BUILD_TYPE=Release')
+    , 'WIN_CPU_MKL': (
+        '-DUSE_CUDA=OFF '
+        '-DUSE_CUDNN=OFF '
+        '-DUSE_NVRTC=OFF '
+        '-DUSE_OPENCV=ON '
+        '-DUSE_OPENMP=ON '
+        '-DUSE_BLAS=mkl '
+        '-DUSE_LAPACK=ON '
+        '-DUSE_DIST_KVSTORE=OFF '
+        '-DUSE_MKL_IF_AVAILABLE=ON '
+        '-DUSE_MKLDNN=OFF '
+        '-DCMAKE_BUILD_TYPE=Release')
+
+    , 'WIN_GPU': (
+        '-DUSE_CUDA=ON '
+        '-DUSE_CUDNN=ON '
+        '-DUSE_NVRTC=ON '
+        '-DUSE_OPENCV=ON  '
+        '-DUSE_OPENMP=ON '
+        '-DUSE_BLAS=open '
+        '-DUSE_LAPACK=ON '
+        '-DUSE_DIST_KVSTORE=OFF '
+        '-DCUDA_ARCH_NAME=Manual '
+        '-DCUDA_ARCH_BIN=52 '
+        '-DCUDA_ARCH_PTX=52 '
+        '-DCMAKE_CXX_FLAGS="/FS /MD /O2 /Ob2" '
+        '-DUSE_MKL_IF_AVAILABLE=OFF '
+        '-DCMAKE_BUILD_TYPE=Release')
+
+    , 'WIN_GPU_MKLDNN': (
+        '-DUSE_CUDA=ON '
+        '-DUSE_CUDNN=ON '
+        '-DUSE_NVRTC=ON '
+        '-DUSE_OPENCV=ON '
+        '-DUSE_OPENMP=ON '
+        '-DUSE_BLAS=open '
+        '-DUSE_LAPACK=ON '
+        '-DUSE_DIST_KVSTORE=OFF '
+        '-DCUDA_ARCH_NAME=Manual '
+        '-DCUDA_ARCH_BIN=52 '
+        '-DCUDA_ARCH_PTX=52 '
+        '-DUSE_MKLDNN=ON '
+        '-DCMAKE_CXX_FLAGS="/FS /MD /O2 /Ob2" '
+        '-DCMAKE_BUILD_TYPE=Release')
 
 }
 
@@ -160,9 +189,6 @@ def windows_package(args):
         copy_tree('python', j(pkgdir, 'python'))
         logging.info('packing headers')
         copy_tree('include', j(pkgdir, 'include'))
-        copy_tree(j('3rdparty','dmlc-core','include'), j(pkgdir, 'include'))
-        copy_tree(j('3rdparty','mshadow', 'mshadow'), j(pkgdir, 'include', 'mshadow'))
-        copy_tree(j('3rdparty','tvm','nnvm', 'include'), j(pkgdir,'include', 'nnvm', 'include'))
         logging.info("Compressing package: %s", pkgfile)
         check_call(['7z', 'a', pkgfile, pkgdir])
 
@@ -216,11 +242,13 @@ def main():
     if system == 'Windows':
         logging.info("Detected Windows platform")
         if 'OpenBLAS_HOME' not in os.environ:
-            os.environ["OpenBLAS_HOME"] = "C:\\mxnet\\openblas"
+            os.environ["OpenBLAS_HOME"] = "C:\\Program Files\\OpenBLAS-v0.2.19"
         if 'OpenCV_DIR' not in os.environ:
-            os.environ["OpenCV_DIR"] = "C:\\mxnet\\opencv_vc14"
+            os.environ["OpenCV_DIR"] = "C:\\Program Files\\OpenCV-v3.4.1\\build"
         if 'CUDA_PATH' not in os.environ:
-            os.environ["CUDA_PATH"] = "C:\\CUDA\\v8.0"
+            os.environ["CUDA_PATH"] = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v9.2"
+        if 'MKL_ROOT' not in os.environ:
+            os.environ["MKL_ROOT"] = "C:\\Program Files (x86)\\IntelSWTools\\compilers_and_libraries\\windows\\mkl"
         windows_build(args)
 
     elif system == 'Linux' or system == 'Darwin':
